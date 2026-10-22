@@ -1,0 +1,82 @@
+# 按刻 · Presslet
+
+在 Mac 触控板上重按一下，把当前 App 的常用动作放到指针旁。
+
+按刻是一个原生 macOS 小工具。它会根据前台 App 显示不同的动作菜单，支持发送快捷键、打开应用或网址，以及运行已有的快捷指令。菜单带有淡入、毛玻璃背景和收起动画，也会跟随系统的“减少动态效果”设置。
+
+## 安装与开始使用
+
+需要 Apple Silicon Mac、macOS 14 或更新版本，以及支持 Force Touch 的触控板。当前发行包为 arm64。跨 App 重按和系统动作接管已在开发用 Mac 的 Edge 中实测；其他 App、设备与系统版本需要进一步使用验证。
+
+1. 从 [Releases](https://github.com/zhangxiao91/presslet/releases/latest) 下载发行包，解压后将 `Presslet.app` 拖入“应用程序”。如果使用 DMG，打开后拖入其中的“应用程序”文件夹。
+2. 打开按刻，根据首页提示前往“系统设置 → 隐私与安全性 → 辅助功能”，允许按刻控制输入，再回到按刻重试连接。
+3. 点击“管理 App 动作…”，选择 App，编辑菜单后保存。
+4. 回到目标 App，按下触控板并继续加力。菜单出现后松开，再点击动作，或按对应的数字键。按 Esc 或点击菜单外可关闭。
+
+当前发行包采用本地 ad-hoc 签名，尚未通过 Apple 公证。macOS 可能显示安全提示；确认下载来源后，可在“系统设置 → 隐私与安全性”中查看系统提供的打开选项。更新或移动应用后，如果系统仍显示已授权但连接失败，可在辅助功能列表中移除旧条目，再添加实际使用的这一份 App。
+
+关闭首页开关可暂停跨 App 重按；退出应用会停止接管。关闭首页窗口后，按刻仍可从菜单栏打开。
+
+## 按 App 配置动作
+
+初始配置包含“通用”、Microsoft Edge 和 Finder。没有单独配置的 App 使用通用菜单；为某个 App 关闭菜单后，该 App 会保持关闭。每个菜单最多启用 9 个动作，可调整顺序、名称和启用状态。
+
+| 动作类型 | 内容示例 | 用法 |
+| --- | --- | --- |
+| 键盘快捷键 | `cmd+l`、`cmd+shift+g` | 将快捷键发送到呼出菜单的 App |
+| 打开 App 或网址 | `com.apple.calculator`、`https://www.apple.com` | 可通过“选择应用…”填写，或输入应用标识、完整 `.app` 路径、HTTP/HTTPS 网址 |
+| 运行快捷指令 | 已有的快捷指令名称 | 在系统“快捷指令”App 中先创建，再填写完全相同的名称 |
+
+快捷键由 `cmd`、`option`、`ctrl`、`shift` 中的修饰键，加一个字母、数字、方向键或支持的功能键组成。动作会使用目标 App 自己的快捷键含义。
+
+为某个 App 开启“接管系统重按”，可让按刻处理重按并避免同时出现系统查词或预览。Edge 预设默认开启，通用和 Finder 默认保留系统重按。不同 App 对重按的处理可能不同，可分别选择。
+
+配置窗的预览可以检查动作顺序；发送快捷键的完整效果请回到目标 App 通过重按验证。快捷指令可能要求额外的系统权限，按其自身提示处理。
+
+## 其他入口
+
+| 快捷键 | 功能 |
+| --- | --- |
+| `Control + Option + M` | 预览动作菜单 |
+| `Control + Option + 空格` | 在指针旁打开浮层，再在浮层上重按 |
+| `Command + ,` | 打开按 App 配置 |
+
+首页的“诊断…”入口保留力度显示，方便检查触控板是否识别到重按。日常使用无需打开。
+
+## 配置与权限
+
+动作配置保存在本机：
+
+```text
+~/Library/Application Support/dev.zxlab.Presslet/actions.json
+```
+
+点击“保存”后生效，退出重开会重新载入。首次运行正式版时，如果新目录尚无配置，会读取测试版 `dev.zxlab.ForcePressBlockTest/actions.json` 中有效的旧配置，并保存到新目录；旧文件保留。配置损坏时会提示错误并暂用预设，原文件不会在载入时被覆盖。
+
+辅助功能权限用于接管重按和发送快捷键。跨 App 输入监听由系统事件接口提供；若系统提示输入监控权限，可在同一隐私设置页面中管理。应用配置在本机读写；打开的网址和运行的快捷指令由相应 App 处理。
+
+## 从源码编译
+
+需要 Apple Silicon Mac 和 Apple Command Line Tools。项目使用 Swift、AppKit、Core Graphics 与 Carbon，不需要第三方包。
+
+```sh
+bash scripts/test.sh
+bash build.sh
+```
+
+应用生成在 `build/Presslet.app`。构建脚本默认使用 ad-hoc 签名，也可通过 `CODESIGN_IDENTITY` 指定本机签名身份。
+
+```sh
+bash scripts/package.sh
+bash scripts/package.sh --dmg
+```
+
+打包前会运行测试并重新构建，发行文件生成在 `dist/`。`--dmg` 会同时生成 ZIP 和 DMG。构建产物与本机配置均不纳入源码仓库。
+
+测试覆盖力度状态、单次按压的菜单触发，以及配置校验、保存和旧配置读取。真实力度、系统动作接管与窗口动画需要物理触控板检查，参见[手动检查说明](docs/manual-testing.md)。
+
+## 来源与许可
+
+按刻采用 [MIT License](LICENSE)。跨 App 压力输入参考 Hammerspoon 的公开实现流程后独立编写，技术来源及适用范围见 [SOURCES.md](SOURCES.md)。
+
+版本记录见 [CHANGELOG.md](CHANGELOG.md)。

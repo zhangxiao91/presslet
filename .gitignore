@@ -1,0 +1,41 @@
+# macOS and editor files
+.DS_Store
+.AppleDouble
+.LSOverride
+.idea/
+.vscode/
+*.swp
+*~
+
+# Build products and local caches
+/build/
+/dist/
+*.app/
+*.dmg
+*.zip
+*.dSYM/
+DerivedData/
+.swiftpm/
+.build/
+xcuserdata/
+*.xcuserstate
+
+# Local settings, credentials, and development output
+.env
+.env.*
+!.env.example
+*.log
+/logs/
+/privateconfig/
+/private-config/
+/development/
+/dev-output/
+/outputs/
+/work/
+config.local.*
+actions.json
+*.p12
+*.mobileprovision
+*.pem
+*.key
+*.p8

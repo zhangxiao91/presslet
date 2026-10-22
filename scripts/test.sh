@@ -1,0 +1,32 @@
+#!/bin/bash
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+TEST_BUILD_DIR="$PROJECT_DIR/build/tests"
+mkdir -p "$TEST_BUILD_DIR" "$PROJECT_DIR/build/module-cache"
+
+for TEST_SOURCE in "$PROJECT_DIR"/Tests/*Tests.swift; do
+  TEST_NAME="$(basename "$TEST_SOURCE" .swift)"
+  TEST_SOURCES=()
+  case "$TEST_NAME" in
+    PressureCoreTests)
+      TEST_SOURCES+=("$PROJECT_DIR/Sources/PressureCore.swift")
+      ;;
+    PressMenuGateTests)
+      TEST_SOURCES+=("$PROJECT_DIR/Sources/PressMenuGate.swift")
+      ;;
+    ActionConfigurationTests|ConfigurationMigrationTests)
+      TEST_SOURCES+=("$PROJECT_DIR/Sources/ActionConfiguration.swift")
+      ;;
+    *)
+      printf 'Add source dependencies for %s in scripts/test.sh\n' "$TEST_NAME" >&2
+      exit 2
+      ;;
+  esac
+  xcrun swiftc \
+    -target "$(uname -m)-apple-macosx14.0" -swift-version 5 \
+    -module-cache-path "$PROJECT_DIR/build/module-cache" \
+    "${TEST_SOURCES[@]}" "$TEST_SOURCE" \
+    -o "$TEST_BUILD_DIR/$TEST_NAME"
+  "$TEST_BUILD_DIR/$TEST_NAME"
+done
