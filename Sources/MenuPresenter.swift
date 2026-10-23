@@ -7,6 +7,7 @@ final class MenuPresenter: NSObject {
     var onStateChange: (() -> Void)?
 
     private(set) var menuID: UUID?
+    private(set) var presentedAt: TimeInterval = 0
     private(set) var targetApp: NSRunningApplication?
     private(set) var profileBundleID = "*"
     var isVisible: Bool { panel?.isVisible == true }
@@ -17,12 +18,12 @@ final class MenuPresenter: NSObject {
     private var panel: ActionPanel?
     private var actions: [MenuAction] = []
     private var context: ActionContext?
-    private var inputButtons: [NSButton] = []
     private var inputLabel: NSTextField?
     private var pressHeld = false
     private var radialSelection: RadialSelection?
     private var radialOrigin = NSPoint.zero
     private var radialLastPoint = NSPoint.zero
+    private var radialTriggerPoint: NSPoint?
     private var radialFeedback = PressureFeedback()
     private var radialCompression: CGFloat = 0
 
@@ -39,23 +40,23 @@ final class MenuPresenter: NSObject {
         if panel != nil { dismiss(reason: "打开新菜单") }
         let id = UUID()
         menuID = id
+        presentedAt = ProcessInfo.processInfo.systemUptime
         actions = enabled
         targetApp = target
         profileBundleID = profile.bundleID
         self.context = acceptedContext(context)
-        inputButtons = []
         inputLabel = nil
         pressHeld = held
 
-        let radial = actions.count <= 3
-        let p = ActionPanel(contentRect: NSRect(x: 0, y: 0, width: radial ? 480 : 340,
-                                               height: radial ? 400 : 168 + CGFloat(actions.count) * 38),
+        let layout = RadialMenuView.layoutSize(for: actions.count)
+        let anchor = RadialMenuView.anchor(for: actions.count)
+        let p = ActionPanel(contentRect: NSRect(x: 0, y: 0, width: layout.width + 20, height: layout.height + 76),
                             styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         p.actionCount = actions.count
         p.title = "动作菜单"
         p.backgroundColor = .clear
         p.isOpaque = false
-        p.hasShadow = !radial
+        p.hasShadow = false
         p.isReleasedWhenClosed = false
         p.level = .popUpMenu
         p.hidesOnDeactivate = false
@@ -63,101 +64,76 @@ final class MenuPresenter: NSObject {
         let appName = profile.bundleID == "*" ? (target?.localizedName ?? "通用动作") : profile.appName
         let visible = NSScreen.screens.first(where: { $0.frame.contains(point) })?.visibleFrame
             ?? NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1000, height: 800)
+        let panelAnchor = NSPoint(x: anchor.x + 10, y: anchor.y)
+        let placement = RadialMenuPlacement(trigger: point, panelSize: p.frame.size, anchor: panelAnchor, visibleFrame: visible)
+        p.setFrameOrigin(placement.frame.origin)
+        radialOrigin = placement.center
+        radialLastPoint = radialOrigin
+        radialTriggerPoint = held ? point : nil
 
-        if radial {
-            let host = NSView(frame: NSRect(origin: .zero, size: p.frame.size))
-            host.wantsLayer = true
-            p.contentView = host
-            let directions: [RadialDirection] = [.up, .left, .right]
-            let items = actions.enumerated().map { index, action in
-                RadialItem(id: action.id, title: action.title,
-                           symbol: action.kind == .workflow ? "wand.and.stars" : action.kind == .open ? "arrow.up.forward.app" : "command",
-                           direction: directions[index])
-            }
-            p.radialMenu = RadialMenuView(items: items, appName: appName, defaultIndex: nil)
-            p.radialMenu?.useFloatingBackdrop()
-            radialOrigin = point
-            radialLastPoint = point
-            radialSelection = RadialSelection(center: point, items: items, outerRadius: 230)
-            radialFeedback.reset()
-            radialCompression = held ? PressureFeedback.minimumCompression : 0
-            let heading = label(appName, size: 12, weight: .medium, color: .secondaryLabelColor)
-            heading.alignment = .center
-            let caption = label("", size: 12, color: .secondaryLabelColor)
-            caption.alignment = .center
-            caption.maximumNumberOfLines = 2
-            caption.lineBreakMode = .byTruncatingTail
-            p.setFrameOrigin(NSPoint(x: point.x - 240, y: point.y - 165))
-            let infoSurface = NSVisualEffectView(frame: NSRect(x: 56, y: 326, width: 368, height: 68))
-            infoSurface.material = .popover
-            infoSurface.blendingMode = .behindWindow
-            infoSurface.state = .active
-            infoSurface.wantsLayer = true
-            infoSurface.layer?.cornerRadius = 18
-            infoSurface.layer?.masksToBounds = true
-            host.addSubview(infoSurface)
-            heading.frame = NSRect(x: 68, y: 365, width: 344, height: 20)
-            caption.frame = NSRect(x: 68, y: 330, width: 344, height: 32)
-            host.addSubview(heading)
-            host.addSubview(caption)
-            inputLabel = caption
-            p.onRadialPoint = { [weak self] point, commit in
-                self?.updatePointer(point)
-                if commit { self?.commitRadialSelection() }
-            }
-            p.onRadialKey = { [weak self] key in
-                guard let self else { return }
-                if key == 36 { self.commitRadialSelection(); return }
-                let offset: CGPoint = key == 123 ? CGPoint(x: -145, y: 0)
-                    : key == 124 ? CGPoint(x: 145, y: 0)
-                    : key == 126 ? CGPoint(x: 0, y: 118)
-                    : key == 125 ? CGPoint(x: 0, y: -118) : .zero
-                self.updatePointer(NSPoint(x: self.radialOrigin.x + offset.x, y: self.radialOrigin.y + offset.y))
-            }
-        } else {
-            radialSelection = nil
-            let background = NSVisualEffectView()
-            background.material = .menu
-            background.blendingMode = .behindWindow
-            background.state = .active
-            background.wantsLayer = true
-            background.layer?.cornerRadius = 12
-            background.layer?.masksToBounds = true
-            p.contentView = background
-            let caption = label("", size: 12, color: .secondaryLabelColor)
-            inputLabel = caption
-            var views: [NSView] = [label(appName, size: 18, weight: .semibold), caption]
-            for (index, action) in actions.enumerated() {
-                let row = button("\(index + 1)   \(action.title)", self, #selector(configuredAction(_:)))
-                row.tag = index + 1
-                row.alignment = .left
-                row.lineBreakMode = .byTruncatingTail
-                inputButtons.append(row)
-                views.append(row)
-            }
-            let configure = button("配置…", self, #selector(configure))
-            views.append(stack([label("数字选择 · Esc 关闭", size: 11, color: .secondaryLabelColor), configure], vertical: false, spacing: 16))
-            let content = stack(views, spacing: 10)
-            content.translatesAutoresizingMaskIntoConstraints = false
-            background.addSubview(content)
-            NSLayoutConstraint.activate([
-                content.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 20),
-                content.topAnchor.constraint(equalTo: background.topAnchor, constant: 16),
-                content.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -20)
-            ])
-            p.setFrameOrigin(NSPoint(x: min(max(visible.minX + 8, point.x + 12), visible.maxX - p.frame.width - 8),
-                                     y: min(max(visible.minY + 8, point.y - p.frame.height - 12), visible.maxY - p.frame.height - 8)))
+        let host = NSView(frame: NSRect(origin: .zero, size: p.frame.size))
+        host.wantsLayer = true
+        p.contentView = host
+        let items = actions.enumerated().map { index, action in
+            RadialItem(id: action.id, title: action.title,
+                       symbol: action.kind == .workflow ? "wand.and.stars" : action.kind == .open ? "arrow.up.forward.app" : "command",
+                       angle: RadialItem.menuAngle(index: index, count: actions.count))
         }
-
+        p.radialMenu = RadialMenuView(items: items, appName: appName, defaultIndex: nil)
+        p.radialMenu?.useFloatingBackdrop()
+        p.radialMenu?.onClick = { [weak self] index in self?.performAction(index + 1) }
+        p.radialMenu?.onCancel = { [weak self] in self?.dismiss(reason: "取消") }
+        radialSelection = RadialSelection(center: radialOrigin, items: items, outerRadius: actions.count <= 3 ? 230 : 310)
+        radialFeedback.reset()
+        radialCompression = held ? PressureFeedback.minimumCompression : 0
+        let heading = label(appName, size: 12, weight: .medium, color: .secondaryLabelColor)
+        heading.alignment = .center
+        let caption = label("", size: 12, color: .secondaryLabelColor)
+        caption.alignment = .center
+        caption.maximumNumberOfLines = 2
+        caption.lineBreakMode = .byTruncatingTail
+        let infoWidth = min(368, layout.width - 80)
+        let infoX = (p.frame.width - infoWidth) / 2
+        let infoY = layout.height - 4
+        let infoSurface = NSVisualEffectView(frame: NSRect(x: infoX, y: infoY, width: infoWidth, height: 68))
+        infoSurface.material = .popover
+        infoSurface.blendingMode = .behindWindow
+        infoSurface.state = .active
+        infoSurface.wantsLayer = true
+        infoSurface.layer?.cornerRadius = 18
+        infoSurface.layer?.masksToBounds = true
+        host.addSubview(infoSurface)
+        heading.frame = NSRect(x: infoX + 32, y: infoY + 39, width: infoWidth - 64, height: 20)
+        caption.frame = NSRect(x: infoX + 12, y: infoY + 4, width: infoWidth - 24, height: 32)
+        host.addSubview(heading)
+        host.addSubview(caption)
+        let configureButton = NSButton(image: NSImage(systemSymbolName: "gearshape", accessibilityDescription: "配置动作")!,
+                                       target: self, action: #selector(configure))
+        configureButton.isBordered = false
+        configureButton.toolTip = "配置动作"
+        configureButton.frame = NSRect(x: infoX + infoWidth - 30, y: infoY + 38, width: 22, height: 22)
+        host.addSubview(configureButton)
+        inputLabel = caption
+        p.onRadialPoint = { [weak self] point, commit in
+            self?.updatePointer(point)
+            if commit { self?.commitRadialSelection() }
+        }
+        p.onRadialKey = { [weak self] key in
+            guard let self else { return }
+            if key == 36 { self.commitRadialSelection(); return }
+            let offset: CGPoint = key == 123 ? CGPoint(x: -145, y: 0)
+                : key == 124 ? CGPoint(x: 145, y: 0)
+                : key == 126 ? CGPoint(x: 0, y: 118)
+                : key == 125 ? CGPoint(x: 0, y: -118) : .zero
+            self.updatePointer(NSPoint(x: self.radialOrigin.x + offset.x, y: self.radialOrigin.y + offset.y))
+        }
         p.perform = { [weak self] n in self?.performAction(n) }
         p.onDismiss = { [weak self] in self?.dismiss(reason: "按 Esc") }
         panel = p
         p.setPressHeld(pressHeld)
         refreshInputState()
-        p.present(from: point)
-        if radial {
-            p.radialMenu?.updateInteraction(displacement: .zero, compression: pressHeld ? PressureFeedback.minimumCompression : 0)
-        }
+        p.present(from: radialOrigin)
+        p.radialMenu?.updateInteraction(displacement: .zero, compression: radialCompression)
         onStateChange?()
         return id
     }
@@ -170,6 +146,9 @@ final class MenuPresenter: NSObject {
 
     func updatePointer(_ point: NSPoint) {
         guard var selection = radialSelection, let view = panel?.radialMenu else { return }
+        // At a screen edge the menu shifts inward. Releasing at the original
+        // press location must still cancel, even when that point is off-center.
+        let point = radialTriggerPoint.map { hypot(point.x - $0.x, point.y - $0.y) <= 16 } == true ? radialOrigin : point
         radialLastPoint = point
         let previous = selection.focus
         let focus = selection.update(point)
@@ -198,19 +177,8 @@ final class MenuPresenter: NSObject {
 
     func release(at point: NSPoint) {
         guard pressHeld, isVisible else { return }
-        if hasRadialMenu {
-            updatePointer(point)
-            commitRadialSelection()
-            return
-        }
-        pressHeld = false
-        let heldPanel = panel
-        onStateChange?()
-        // The release that opened a list must not activate one of its rows.
-        DispatchQueue.main.async { [weak self, weak heldPanel] in
-            guard let self, let heldPanel, self.panel === heldPanel, !self.pressHeld else { return }
-            heldPanel.setPressHeld(false)
-        }
+        updatePointer(point)
+        commitRadialSelection()
     }
 
     func dismiss(reason: String) {
@@ -236,8 +204,6 @@ final class MenuPresenter: NSObject {
         onAction?(action, target, actionContext, resultPoint)
     }
 
-    @objc private func configuredAction(_ sender: NSButton) { performAction(sender.tag) }
-
     @objc private func configure() {
         dismiss(reason: "打开配置")
         onConfigure?()
@@ -254,10 +220,6 @@ final class MenuPresenter: NSObject {
             if action.inputRequirement == .none { return ActionAvailability(isAvailable: true) }
             return context?.availability(for: action.inputRequirement)
                 ?? ActionAvailability(isAvailable: false, reason: "正在读取选中内容…")
-        }
-        for (index, row) in inputButtons.enumerated() {
-            row.isEnabled = states[index].isAvailable
-            row.toolTip = states[index].reason ?? actions[index].inputRequirement.displayName
         }
         panel?.radialMenu?.setAvailability(states.map { $0.isAvailable })
         if let text = context?.selectedText, !text.isEmpty {
@@ -286,9 +248,9 @@ final class MenuPresenter: NSObject {
         let closing = panel
         panel = nil
         radialSelection = nil
+        radialTriggerPoint = nil
         context = nil
         inputLabel = nil
-        inputButtons = []
         actions = []
         menuID = nil
         targetApp = nil

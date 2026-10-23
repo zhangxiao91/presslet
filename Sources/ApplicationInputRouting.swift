@@ -3,6 +3,9 @@ import ApplicationServices
 
 extension LabController {
     func routeLocalInput(_ event: NSEvent) {
+        // An opener click can be delivered after its button has shown a menu.
+        // It belongs to the previous window, not the newly presented menu.
+        if menuPresenter.isVisible, event.timestamp < menuPresenter.presentedAt { return }
         if event.type == .keyDown, event.keyCode == 53, menuPresenter.isVisible {
             dismissActionMenu(reason: "按 Esc"); return
         }

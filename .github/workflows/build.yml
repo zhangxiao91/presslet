@@ -11,9 +11,15 @@ permissions:
 
 jobs:
   macos:
-    runs-on: macos-14
+    runs-on: macos-26
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
     steps:
       - uses: actions/checkout@v4
+      - name: Check build tools
+        run: |
+          xcodebuild -version
+          xcrun --show-sdk-version
       - name: Test and package
         run: ./scripts/package.sh
       - name: Upload Apple Silicon build

@@ -17,7 +17,44 @@ struct RadialItem {
     let id: String
     let title: String
     let symbol: String
-    let direction: RadialDirection
+    let direction: RadialDirection?
+    let angle: CGFloat
+
+    init(id: String, title: String, symbol: String, direction: RadialDirection) {
+        self.id = id
+        self.title = title
+        self.symbol = symbol
+        self.direction = direction
+        self.angle = direction.angle
+    }
+
+    init(id: String, title: String, symbol: String, angle: CGFloat) {
+        self.id = id
+        self.title = title
+        self.symbol = symbol
+        self.direction = nil
+        self.angle = angle.isFinite ? angle : .pi / 2
+    }
+
+    static func menuAngle(index: Int, count: Int) -> CGFloat {
+        guard count > 3 else {
+            return [CGFloat.pi / 2, .pi, 0][max(0, min(2, index))]
+        }
+        let count = max(4, min(9, count))
+        let angle = CGFloat.pi / 2 - CGFloat(index) * 2 * .pi / CGFloat(count)
+        return atan2(sin(angle) * 165, cos(angle) * 235)
+    }
+
+    static func menuOffset(angle: CGFloat, count: Int) -> CGPoint {
+        guard angle.isFinite else { return CGPoint(x: 0, y: 0) }
+        if count <= 3 {
+            return CGPoint(x: cos(angle) * 145, y: sin(angle) * 118)
+        }
+        // Use the same ray for placement and selection even though the ring is elliptical.
+        let x = cos(angle), y = sin(angle)
+        let radius = 1 / sqrt(x * x / (235 * 235) + y * y / (165 * 165))
+        return CGPoint(x: x * radius, y: y * radius)
+    }
 }
 
 enum RadialFocus: Equatable {
@@ -34,6 +71,7 @@ struct RadialSelection {
     private let center: CGPoint
     private let items: [RadialItem]
     private let defaultIndex: Int?
+    private let isRing: Bool
     private let innerRadius: CGFloat
     private let outerRadius: CGFloat
     private let selectionAngle: CGFloat = 48 * .pi / 180
@@ -42,8 +80,9 @@ struct RadialSelection {
     init(center: CGPoint, items: [RadialItem], defaultIndex: Int? = nil,
          innerRadius: CGFloat = 34, outerRadius: CGFloat = 200) {
         self.center = center
-        let configuredItems = Array(items.prefix(4))
+        let configuredItems = Array(items.prefix(9))
         self.items = configuredItems
+        self.isRing = configuredItems.count >= 4 && configuredItems.contains { $0.direction == nil }
         self.defaultIndex = defaultIndex.flatMap {
             configuredItems.indices.contains($0) ? $0 : nil
         }
@@ -81,19 +120,23 @@ struct RadialSelection {
         }
 
         let angle = atan2(dy, dx)
-        if case .action(let index) = focus,
-           items.indices.contains(index),
-           angularDistance(angle, items[index].direction.angle)
-                <= selectionAngle + hysteresisAngle {
-            return focus
-        }
-
         let closest = items.indices.min {
-            angularDistance(angle, items[$0].direction.angle)
-                < angularDistance(angle, items[$1].direction.angle)
+            angularDistance(angle, items[$0].angle)
+                < angularDistance(angle, items[$1].angle)
+        }
+        if case .action(let index) = focus,
+           items.indices.contains(index) {
+            let currentDistance = angularDistance(angle, items[index].angle)
+            if isRing, let closest {
+                if currentDistance <= angularDistance(angle, items[closest].angle) + hysteresisAngle * 2 {
+                    return focus
+                }
+            } else if currentDistance <= selectionAngle + hysteresisAngle {
+                return focus
+            }
         }
         if let index = closest,
-           angularDistance(angle, items[index].direction.angle) <= selectionAngle {
+           isRing || angularDistance(angle, items[index].angle) <= selectionAngle {
             focus = .action(index)
         } else {
             focus = .outside

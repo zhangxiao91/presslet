@@ -187,7 +187,7 @@ extension LabController {
             let events: [EventRecord]
         }
         let iso = ISO8601DateFormatter()
-        let report = Report(formatVersion: 3, appVersion: "1.1.0-preview.1", startedAt: iso.string(from: startedAt),
+        let report = Report(formatVersion: 3, appVersion: "1.1.0", startedAt: iso.string(from: startedAt),
                             exportedAt: iso.string(from: Date()), os: ProcessInfo.processInfo.operatingSystemVersionString,
                             globalMonitorInstalled: inputState.hasGlobalMonitor, cgTapInstalled: inputState.hasTap,
                             cgTapEnabled: inputState.tapEnabled,
@@ -204,7 +204,7 @@ extension LabController {
                             primaryInput: "gestureTap", autoMenuEnabled: menuOnRelease.state == .on,
                             primaryPressureEvents: gestureSamples, primaryDeepPresses: gestureDeep,
                             menusShown: menusShown, pressMenusShown: pressMenusShown, actionsCompleted: actionsCompleted,
-                            menuMotion: "popover scale ease-out (0.23,1,0.32,1), opacity native ease-out; enter 320ms opacity 0.12 to 1 + scale 0.97; exit 220ms opacity + scale 0.95; native menu background material",
+                            menuMotion: "glass radial expansion for 1-9 actions; enter 320ms; exit 220ms; pressure compression and directional attraction; reduced motion supported",
                             menuTrigger: "first stage 2; ordered asynchronous main-queue delivery before mouse release; response measured from the native event timestamp through presentation submission, including queue delay, not displayed-frame latency",
                             menuResponseLastMilliseconds: menuResponseMilliseconds.last,
                             menuResponseAverageMilliseconds: menuResponseMilliseconds.isEmpty ? nil : menuResponseMilliseconds.reduce(0, +) / Double(menuResponseMilliseconds.count),

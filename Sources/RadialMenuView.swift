@@ -65,6 +65,7 @@ private final class RadialGlassTile: NSView {
     private var compression: CGFloat = 0
     private var opaqueMaterial: Bool?
     private var displayObserver: NSObjectProtocol?
+    var onPress: (() -> Void)?
 
     init(frame: NSRect, round: Bool = false) {
         self.round = round
@@ -130,6 +131,12 @@ private final class RadialGlassTile: NSView {
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         refreshMaterial()
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        guard available, let onPress else { return false }
+        onPress()
+        return true
     }
 
     func setContent(title: String, symbol: String) {
@@ -260,35 +267,54 @@ private final class RadialGlassTile: NSView {
 /// A passive rendering surface. The host owns pressure, drag and release events.
 final class RadialMenuView: NSView {
     static let layoutSize = NSSize(width: 460, height: 330)
-    private static let anchor = NSPoint(x: 230, y: 165)
+    static func layoutSize(for count: Int) -> NSSize {
+        count <= 3 ? layoutSize : NSSize(width: 640, height: 450)
+    }
+    static func anchor(for count: Int) -> NSPoint {
+        let size = layoutSize(for: count)
+        return NSPoint(x: size.width / 2, y: size.height / 2)
+    }
+    private let anchor: NSPoint
     private let items: [RadialItem]
     private let appName: String
     private let defaultIndex: Int?
     private var tiles: [RadialGlassTile] = []
-    private let centerTile = RadialGlassTile(frame: NSRect(x: 202, y: 137, width: 56, height: 56), round: true)
+    private let centerTile: RadialGlassTile
     private var currentFocus = RadialFocus.center
     private var hasLeftCenter = false
     private var closing = false
     private var visibilityGeneration = 0
     private var actionAvailability: [Bool] = []
     var onClick: ((Int) -> Void)?
+    var onCancel: (() -> Void)?
 
     init(items: [RadialItem], appName: String, defaultIndex: Int?) {
+        let items = Array(items.prefix(9))
         self.items = items
+        anchor = Self.anchor(for: items.count)
+        centerTile = RadialGlassTile(frame: NSRect(x: anchor.x - 28, y: anchor.y - 28, width: 56, height: 56), round: true)
         self.appName = appName
         self.defaultIndex = defaultIndex
-        super.init(frame: NSRect(origin: .zero, size: Self.layoutSize))
+        super.init(frame: NSRect(origin: .zero, size: Self.layoutSize(for: items.count)))
         wantsLayer = true
         layer?.masksToBounds = false
-        for item in items {
-            let offset = Self.offset(for: item.direction)
-            let frame = NSRect(x: Self.anchor.x + offset.x - 71, y: Self.anchor.y + offset.y - 28, width: 142, height: 56)
+        for (index, item) in items.enumerated() {
+            let offset = RadialItem.menuOffset(angle: item.angle, count: items.count)
+            let frame = NSRect(x: anchor.x + offset.x - 71, y: anchor.y + offset.y - 28, width: 142, height: 56)
             let tile = RadialGlassTile(frame: frame)
             tile.setContent(title: item.title, symbol: item.symbol)
+            tile.onPress = { [weak self] in
+                guard let self, !self.closing else { return }
+                self.onClick?(index)
+            }
             addSubview(tile)
             tiles.append(tile)
         }
         addSubview(centerTile)
+        centerTile.onPress = { [weak self] in
+            guard let self, !self.closing else { return }
+            self.onCancel?()
+        }
         update(focus: .center, hasLeftCenter: false)
         setAccessibilityElement(true)
         setAccessibilityRole(.group)
@@ -309,7 +335,7 @@ final class RadialMenuView: NSView {
     func present(at point: CGPoint, in host: NSView) {
         visibilityGeneration += 1
         closing = false
-        frame.origin = NSPoint(x: point.x - Self.anchor.x, y: point.y - Self.anchor.y)
+        frame.origin = NSPoint(x: point.x - anchor.x, y: point.y - anchor.y)
         if superview !== host { host.addSubview(self) }
         let reduce = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         let duration = reduce ? RadialMotion.reduced : RadialMotion.reveal
@@ -317,7 +343,7 @@ final class RadialMenuView: NSView {
         CATransaction.setDisableActions(true)
         layer?.opacity = 0
         for (index, tile) in tiles.enumerated() {
-            let offset = Self.offset(for: items[index].direction)
+            let offset = RadialItem.menuOffset(angle: items[index].angle, count: items.count)
             tile.layer?.transform = reduce ? CATransform3DIdentity : Self.collapsedTransform(offset: offset)
         }
         centerTile.layer?.transform = reduce ? CATransform3DIdentity : CATransform3DMakeScale(0.97, 0.97, 1)
@@ -332,6 +358,7 @@ final class RadialMenuView: NSView {
     func setAvailability(_ availability: [Bool]) {
         actionAvailability = availability
         for (index, tile) in tiles.enumerated() { tile.setAvailable(availability.indices.contains(index) ? availability[index] : true) }
+        update(focus: currentFocus, hasLeftCenter: hasLeftCenter)
     }
     func update(focus: RadialFocus, hasLeftCenter: Bool) {
         guard !closing else { return }
@@ -343,7 +370,8 @@ final class RadialMenuView: NSView {
         }
         switch focus {
         case .center:
-            if !hasLeftCenter, let index = defaultIndex, items.indices.contains(index) {
+            if !hasLeftCenter, let index = defaultIndex, items.indices.contains(index),
+               !actionAvailability.indices.contains(index) || actionAvailability[index] {
                 centerTile.setContent(title: "松手执行", symbol: items[index].symbol)
                 centerTile.setSelected(true, reduceMotion: reduce)
             } else {
@@ -356,7 +384,7 @@ final class RadialMenuView: NSView {
                 centerTile.setSelected(false, reduceMotion: reduce)
                 return
             }
-            centerTile.setContent(title: "松手执行", symbol: items.indices.contains(index) ? Self.arrow(for: items[index].direction) : "arrow.up")
+            centerTile.setContent(title: "松手执行", symbol: items.indices.contains(index) ? Self.arrow(for: items[index].angle) : "arrow.up")
             centerTile.setSelected(false, reduceMotion: reduce)
         case .outside:
             centerTile.setContent(title: "取消", symbol: "xmark")
@@ -383,7 +411,7 @@ final class RadialMenuView: NSView {
         if let layer = layer { RadialMotion.opacity(layer, to: 0, duration: duration) }
         for (index, tile) in tiles.enumerated() {
             guard let layer = tile.layer else { continue }
-            let transform = reduce ? CATransform3DIdentity : Self.collapsedTransform(offset: Self.offset(for: items[index].direction))
+            let transform = reduce ? CATransform3DIdentity : Self.collapsedTransform(offset: RadialItem.menuOffset(angle: items[index].angle, count: items.count))
             RadialMotion.transform(layer, to: transform, duration: duration, key: "appearance")
         }
         if let layer = centerTile.layer, !reduce {
@@ -404,7 +432,7 @@ final class RadialMenuView: NSView {
         let approach = min(1, radius / 110)
         let edgeFade = max(0, min(1, (265 - radius) / 35))
         for (index, tile) in tiles.enumerated() {
-            let offset = Self.offset(for: items[index].direction)
+            let offset = RadialItem.menuOffset(angle: items[index].angle, count: items.count)
             let offsetLength = hypot(offset.x, offset.y)
             let alignment = max(0, (offset.x * pointerUnit.x + offset.y * pointerUnit.y) / offsetLength)
             let amount = reduce ? 0 : 5 * pow(alignment, 4) * approach * edgeFade
@@ -417,22 +445,11 @@ final class RadialMenuView: NSView {
         centerTile.setInteraction(attraction: .zero, compression: max(0, min(1, compression)))
     }
 
-    private static func offset(for direction: RadialDirection) -> CGPoint {
-        switch direction {
-        case .up: return CGPoint(x: 0, y: 118)
-        case .right: return CGPoint(x: 145, y: 0)
-        case .down: return CGPoint(x: 0, y: -118)
-        case .left: return CGPoint(x: -145, y: 0)
-        }
-    }
-
-    private static func arrow(for direction: RadialDirection) -> String {
-        switch direction {
-        case .up: return "arrow.up"
-        case .right: return "arrow.right"
-        case .down: return "arrow.down"
-        case .left: return "arrow.left"
-        }
+    private static func arrow(for angle: CGFloat) -> String {
+        let symbols = ["arrow.right", "arrow.up.right", "arrow.up", "arrow.up.left",
+                       "arrow.left", "arrow.down.left", "arrow.down", "arrow.down.right"]
+        let sector = Int((angle / (.pi / 4)).rounded())
+        return symbols[(sector % 8 + 8) % 8]
     }
 
     private static func collapsedTransform(offset: CGPoint) -> CATransform3D {
