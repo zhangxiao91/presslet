@@ -15,6 +15,15 @@ for TEST_SOURCE in "$PROJECT_DIR"/Tests/*Tests.swift "$PROJECT_DIR"/Prototypes/R
     PressMenuGateTests)
       TEST_SOURCES+=("$PROJECT_DIR/Sources/PressMenuGate.swift")
       ;;
+    PressureInputManagerTests)
+      TEST_SOURCES+=("$PROJECT_DIR/Sources/PressureEventBuffer.swift")
+      ;;
+    ActionProviderTests)
+      TEST_SOURCES+=("$PROJECT_DIR/Sources/ActionConfiguration.swift" "$PROJECT_DIR/Sources/ActionContext.swift" "$PROJECT_DIR/Sources/ActionProvider.swift")
+      ;;
+    ContextResolverTests)
+      TEST_SOURCES+=("$PROJECT_DIR/Sources/ActionConfiguration.swift" "$PROJECT_DIR/Sources/ActionContext.swift" "$PROJECT_DIR/Sources/SelectionContextProvider.swift" "$PROJECT_DIR/Sources/ContextResolver.swift")
+      ;;
     ActionConfigurationTests|ConfigurationMigrationTests)
       TEST_SOURCES+=("$PROJECT_DIR/Sources/ActionConfiguration.swift" "$PROJECT_DIR/Sources/ActionContext.swift")
       ;;

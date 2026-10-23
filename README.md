@@ -75,6 +75,10 @@
 
 ## 从源码编译
 
+源码按四个组件分工：`PressureInputManager` 接收输入，`ContextResolver` 确定本次操作的选中文字或文件，`ActionProvider` 选择当前 App 的动作，`MenuPresenter` 显示菜单并返回选择。`App.swift` 连接这些组件，最终动作交给 `ActionExecutor` 执行。
+
+跨 App 事件在专用 run loop 线程中接收。回调按已载入的规则决定是否拦截，将事件放入有容量限制的缓冲区，再按顺序交给主线程处理。菜单显示和选区读取安排在回调之外；AX 读取另用后台串行队列。输入积压或连接中断时会取消本次重按，等待下一次按下，避免留下半个手势继续执行动作。
+
 需要 Apple Silicon Mac 和 Apple Command Line Tools。项目使用 Swift、AppKit、Core Graphics 与 Carbon，不需要第三方包。
 
 ```sh
