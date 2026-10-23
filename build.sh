@@ -18,6 +18,9 @@ xcrun swiftc \
   -module-cache-path "$BUILD_DIR/module-cache" \
   -framework AppKit -framework Carbon -framework ApplicationServices \
   "$PROJECT_DIR"/Sources/*.swift \
+  "$PROJECT_DIR/Prototypes/RadialPreview/RadialSelection.swift" \
+  "$PROJECT_DIR/Prototypes/RadialPreview/RadialMenuView.swift" \
+  "$PROJECT_DIR/Prototypes/RadialPreview/PressureFeedback.swift" \
   -o "$BUILD_DIR/Presslet"
 
 xcrun swiftc \

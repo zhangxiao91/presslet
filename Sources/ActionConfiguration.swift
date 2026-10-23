@@ -12,20 +12,50 @@ enum ActionKind: String, Codable, CaseIterable {
     }
 }
 
+enum ActionInputRequirement: String, Codable, CaseIterable {
+    case none, selectedText, selectedFiles, selectedImages
+
+    var displayName: String {
+        switch self {
+        case .none: return "无需内容"
+        case .selectedText: return "选中文字"
+        case .selectedFiles: return "选中文件"
+        case .selectedImages: return "选中图片"
+        }
+    }
+}
+
 struct MenuAction: Codable, Equatable, Identifiable {
     var id: String
     var title: String
     var kind: ActionKind
     var value: String
     var isEnabled: Bool
+    var inputRequirement: ActionInputRequirement
 
     init(id: String = UUID().uuidString, title: String, kind: ActionKind,
-         value: String, isEnabled: Bool = true) {
+         value: String, isEnabled: Bool = true, inputRequirement: ActionInputRequirement = .none) {
         self.id = id
         self.title = title
         self.kind = kind
         self.value = value
         self.isEnabled = isEnabled
+        self.inputRequirement = inputRequirement
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, title, kind, value, isEnabled, inputRequirement
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        title = try values.decode(String.self, forKey: .title)
+        kind = try values.decode(ActionKind.self, forKey: .kind)
+        value = try values.decode(String.self, forKey: .value)
+        isEnabled = try values.decode(Bool.self, forKey: .isEnabled)
+        inputRequirement = try values.decodeIfPresent(ActionInputRequirement.self,
+                                                      forKey: .inputRequirement) ?? .none
     }
 
     // Shared by validation and execution: the final element is the key.
@@ -156,6 +186,15 @@ struct ActionConfiguration: Codable, Equatable {
                 case .open:
                     if !Self.isOpenTarget(value) {
                         errors.append("\(prefix)「\(title)」：请填写 App 标识、完整 .app 路径，或 http / https 网址。")
+                    }
+                    if action.inputRequirement == .selectedText {
+                        errors.append("\(prefix)「\(title)」：打开 App 或网址暂不支持文字输入，请改用快捷指令。")
+                    }
+                    if action.inputRequirement == .selectedFiles || action.inputRequirement == .selectedImages {
+                        let scheme = URLComponents(string: value)?.scheme?.lowercased()
+                        if scheme == "http" || scheme == "https" {
+                            errors.append("\(prefix)「\(title)」：文件或图片需交给 App 打开，请填写 App 标识或完整 .app 路径。")
+                        }
                     }
                 case .workflow:
                     if value.isEmpty || value.contains("\n") || value.contains("\r") || value.contains("\0") {

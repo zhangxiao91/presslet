@@ -128,7 +128,7 @@ final class LabController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let tapStatus = label("等待输入连接。", size: 12, color: .secondaryLabelColor)
     let gestureCount = label("跨 App 重按", size: 12, color: .secondaryLabelColor)
     let gestureEnabled = NSButton(checkboxWithTitle: "跨 App 手势输入", target: nil, action: nil)
-    let instruction = label("在 App 中重按并松开，选择动作。⌃⌥空格可打开指针浮层。", size: 13)
+    let instruction = label("重按后保持按住，滑向动作再松手；回中央取消。⌃⌥空格可打开指针浮层。", size: 13)
     let feedback = label("重按触控板，打开常用动作。", size: 12, color: .secondaryLabelColor)
     let logView = NSTextView()
     let summaryView = NSTextView()
@@ -149,6 +149,20 @@ final class LabController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var permissionRow: NSStackView?
     let configurationStore = ActionConfigurationStore()
     let actionExecutor = ActionExecutor()
+    let actionResults = ActionResultController()
+    let selectionProvider = SelectionContextProvider()
+    var gestureSelection: ActionContext?
+    var gestureCaptureID: UUID?
+    var menuGestureCaptureID: UUID?
+    var menuCaptureID = UUID()
+    var menuContext: ActionContext?
+    var menuInputButtons: [NSButton] = []
+    var menuInputLabel: NSTextField?
+    var radialSelection: RadialSelection?
+    var radialOrigin = NSPoint.zero
+    var radialLastPoint = NSPoint.zero
+    var radialFeedback = PressureFeedback()
+    var radialCompression: CGFloat = 0
     var profileSettings: ProfileSettingsController?
     var menuActions: [MenuAction] = []
     var menuTargetApp: NSRunningApplication?
@@ -208,6 +222,12 @@ final class LabController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             do { try configurationStore.save(configurationStore.configuration) }
             catch { feedback.stringValue = "预设尚未保存：\(error.localizedDescription)" }
         }
+        selectionProvider.shouldObserve = { [weak self] bundleID in
+            guard let self, !self.isPaused else { return false }
+            guard let profile = self.configurationStore.configuration.profile(for: bundleID), profile.isEnabled else { return false }
+            return profile.actions.contains { $0.isEnabled && $0.inputRequirement != .none }
+        }
+        selectionProvider.start()
         installLocalMonitor()
         captureOverlay.onEvent = { [weak self] event in self?.receive(event, source: "overlay") }
         captureOverlay.onCommit = { [weak self] app, bundleID in
@@ -221,7 +241,12 @@ final class LabController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
         ) { [weak self] notification in
             guard let self, let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
-            if app.processIdentifier != ProcessInfo.processInfo.processIdentifier { self.lastExternalApp = app }
+            if app.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+                self.lastExternalApp = app
+                if let target = self.menuTargetApp, target.processIdentifier != app.processIdentifier {
+                    self.dismissActionMenu(reason: "切换应用")
+                }
+            }
             if self.captureOverlay.isVisible { self.captureOverlay.dismiss(reason: "切换应用") }
             // Preserve a menu opening in the same physical press. Command-Tab
             // remains an explicit cancellation, including while the finger is held.
@@ -346,7 +371,7 @@ final class LabController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let waysCard = makeHomeCard(ways)
         let footer = stack([feedback, NSView(), button("诊断…", self, #selector(showDiagnostics))], vertical: false, spacing: 14)
         feedback.preferredMaxLayoutWidth = 530
-        feedback.stringValue = "在 App 中按下触控板并继续加力，松开后选择动作。"
+        feedback.stringValue = "重按后保持按住，滑向动作再松手；回中央取消。"
         let root = stack([header, permissions, appCard, waysCard, NSView(), footer], spacing: 14)
         root.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(root)
@@ -472,9 +497,15 @@ final class LabController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func installLocalMonitor() {
-        let mask: NSEvent.EventTypeMask = [.pressure, .leftMouseDown, .leftMouseUp, .leftMouseDragged, .rightMouseDown, .otherMouseDown]
+        let mask: NSEvent.EventTypeMask = [.pressure, .leftMouseDown, .leftMouseUp, .leftMouseDragged, .mouseMoved, .keyDown, .rightMouseDown, .otherMouseDown]
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
             guard let self else { return event }
+            if event.type == .keyDown, event.keyCode == 53, self.panel?.isVisible == true {
+                self.dismissActionMenu(reason: "按 Esc"); return nil
+            }
+            if event.type == .mouseMoved, self.panel?.radialMenu != nil, !self.menuPressHeld {
+                self.updateRadialSelection(at: NSEvent.mouseLocation)
+            }
             if event.type == .leftMouseDown, self.tap == nil {
                 self.suppressGestureUntilUp = self.panel?.isVisible == true
             }
@@ -493,9 +524,14 @@ final class LabController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         observationRequested = true
         cancelCycles()
         cancelPendingMenu()
-        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.pressure, .leftMouseDown, .leftMouseUp, .leftMouseDragged, .rightMouseDown, .otherMouseDown]) { [weak self] event in
+        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.pressure, .leftMouseDown, .leftMouseUp, .leftMouseDragged, .mouseMoved, .keyDown, .rightMouseDown, .otherMouseDown]) { [weak self] event in
             guard let self else { return }
+            if event.type == .keyDown, event.keyCode == 53 { self.dismissActionMenu(reason: "按 Esc"); return }
+            if event.type == .mouseMoved, self.panel?.radialMenu != nil, !self.menuPressHeld {
+                self.updateRadialSelection(at: NSEvent.mouseLocation); return
+            }
             if event.type == .leftMouseDown, self.tap == nil {
+                self.captureSelectionForGesture(in: NSWorkspace.shared.frontmostApplication)
                 self.suppressGestureUntilUp = self.panel?.isVisible == true
             }
             if [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(event.type),
@@ -613,6 +649,7 @@ final class LabController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     let shouldBlock = owner.activeFiltering
                         && owner.menuOnRelease.state == .on && converted.stage >= 2
                         && (owner.blockedThisPress || (eligibleInput && owner.shouldIntercept(bundleID: target ?? "")))
+                    owner.updateRadialPressure(converted)
                     if eligibleInput { owner.receive(converted, source: "gestureTap") }
                     if shouldBlock {
                         owner.blockedPressureEvents += 1
@@ -735,7 +772,8 @@ final class LabController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let self, self.menuGate.isCurrent(trigger) else { return }
             self.menuShowTask = nil
             guard !self.isPaused, self.menuOnRelease.state == .on,
-                  source != "gestureTap" || (self.observationRequested && self.tap != nil) else {
+                  source != "gestureTap" || (self.observationRequested && self.tap != nil),
+                  (NSEvent.pressedMouseButtons & 1) != 0 else {
                 self.cancelPendingMenu()
                 return
             }
@@ -754,7 +792,14 @@ final class LabController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func releaseMenu(source: String, confirmedMouseUp: Bool = false) {
         guard confirmedMouseUp || (NSEvent.pressedMouseButtons & 1) == 0 else { return }
+        defer { if confirmedMouseUp { gestureSelection = nil; gestureCaptureID = nil } }
         guard menuPressHeld else { return }
+        if panel?.radialMenu != nil {
+            guard confirmedMouseUp else { return }
+            updateRadialSelection(at: radialLastPoint)
+            commitRadialSelection()
+            return
+        }
         menuPressHeld = false
         let heldPanel = panel
         // Keep the release belonging to the triggering press out of the new menu.
@@ -776,6 +821,14 @@ final class LabController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let visible = panel?.isVisible == true
         let closingPanel = panel
         panel = nil
+        radialSelection = nil
+        menuCaptureID = UUID()
+        menuContext = nil
+        menuGestureCaptureID = nil
+        gestureSelection = nil
+        gestureCaptureID = nil
+        menuInputLabel = nil
+        menuInputButtons = []
         menuPressHeld = false
         closingPanel?.dismissWithMotion()
         cancelPendingMenu()
@@ -799,10 +852,14 @@ final class LabController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if !suppressGestureUntilUp && !captureOverlay.isVisible {
                 cancelPendingMenu()
                 let app = NSWorkspace.shared.frontmostApplication
+                captureSelectionForGesture(in: app)
                 gestureContext = (app?.localizedName ?? "未知应用", app?.bundleIdentifier ?? "unknown")
                 gestureBeginPoint = appKitPoint(from: event.location)
                 _ = cycles["gestureTap"]?.accept(.mouseDown)
             }
+        }
+        if type == .leftMouseDragged || type == .leftMouseUp, panel?.radialMenu != nil {
+            updateRadialSelection(at: appKitPoint(from: event.location))
         }
         if type == .leftMouseUp {
             _ = cycles["gestureTap"]?.accept(.mouseUp)
@@ -865,7 +922,7 @@ final class LabController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         cancelPendingMenu()
         if menuOnRelease.state != .on { dismissActionMenu(reason: "关闭自动菜单") }
         if menuOnRelease.state == .on {
-            addLine("重按菜单已启用；识别到重按即显示菜单，松开后可选择。")
+            addLine("重按菜单已启用；保持按住滑向动作，松手执行。")
         } else { addLine("重按菜单已关闭；保留事件观察。") }
     }
 
@@ -944,6 +1001,11 @@ final class LabController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.feedback.stringValue = "配置已保存，下一次重按即生效。"
             self.addLine("按 App 配置已保存。")
         }
+        settings.onRequestFinderAccess = { [weak self] in
+            self?.selectionProvider.requestFinderAccess { [weak self] allowed in
+                self?.feedback.stringValue = allowed ? "已允许读取 Finder 选中文件。" : "尚未允许读取 Finder 文件，请在系统设置的自动化中允许按刻控制 Finder。"
+            }
+        }
         settings.onPreview = { [weak self] profile in
             self?.showActionMenu(origin: "配置预览", targetBundleID: profile.bundleID, profileOverride: profile)
         }
@@ -962,10 +1024,7 @@ final class LabController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let profile = profileOverride ?? configurationStore.configuration.profile(for: bundleID),
               profile.isEnabled || profileOverride != nil else { return }
         let actions = Array(profile.actions.filter { $0.isEnabled }.prefix(9))
-        guard !actions.isEmpty else {
-            feedback.stringValue = "此 App 尚无启用的动作，请在配置中添加。"
-            return
-        }
+        guard !actions.isEmpty else { feedback.stringValue = "此 App 尚无启用的动作，请在配置中添加。"; return }
         let target: NSRunningApplication? = {
             if front?.bundleIdentifier == bundleID { return front }
             if lastExternalApp?.bundleIdentifier == bundleID, lastExternalApp?.isTerminated == false { return lastExternalApp }
@@ -973,65 +1032,202 @@ final class LabController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }()
         cancelPendingMenu()
         captureOverlay.dismiss(reason: "显示动作菜单", notify: false)
-        panel?.orderOut(nil)
+        if panel != nil { dismissActionMenu(reason: "打开新菜单") }
         menuActions = actions
         menuTargetApp = target
         menuProfileBundleID = profile.bundleID
-        let p = ActionPanel(contentRect: NSRect(x: 0, y: 0, width: 320, height: 136 + CGFloat(actions.count) * 38),
+        menuInputButtons = []
+        menuInputLabel = nil
+        menuContext = nil
+        menuCaptureID = UUID()
+        let captureID = menuCaptureID
+        menuGestureCaptureID = holdUntilMouseUp ? gestureCaptureID : nil
+        if holdUntilMouseUp, let context = gestureSelection,
+           context.sourcePID == target?.processIdentifier { menuContext = context }
+        let radial = actions.count <= 3
+        let p = ActionPanel(contentRect: NSRect(x: 0, y: 0, width: radial ? 480 : 340,
+                                               height: radial ? 400 : 168 + CGFloat(actions.count) * 38),
                             styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         p.actionCount = actions.count
         p.title = "动作菜单"
         p.backgroundColor = .clear
         p.isOpaque = false
-        p.hasShadow = true
+        p.hasShadow = !radial
         p.isReleasedWhenClosed = false
         p.level = .popUpMenu
         p.hidesOnDeactivate = false
         p.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
-        let bg = NSVisualEffectView()
-        bg.material = .menu
-        bg.isEmphasized = false
-        bg.blendingMode = .behindWindow
-        bg.state = .active
-        bg.wantsLayer = true
-        bg.layer?.cornerRadius = 12
-        bg.layer?.masksToBounds = true
-        p.contentView = bg
         let appName = profile.bundleID == "*" ? (target?.localizedName ?? "通用动作") : profile.appName
-        let subtitle = profile.bundleID == "*" ? "通用动作" : "App 专用动作"
-        var views: [NSView] = [label(appName, size: 18, weight: .semibold), label(subtitle, size: 12, color: .secondaryLabelColor)]
-        for (index, action) in actions.enumerated() {
-            let row = button("\(index + 1)   \(action.title)", self, #selector(configuredAction(_:)))
-            row.tag = index + 1
-            row.alignment = .left
-            row.lineBreakMode = .byTruncatingTail
-            row.toolTip = action.kind.displayName
-            views.append(row)
+        let triggerPoint = point ?? NSEvent.mouseLocation
+        let visible = NSScreen.screens.first(where: { $0.frame.contains(triggerPoint) })?.visibleFrame
+            ?? NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1000, height: 800)
+        if radial {
+            let host = NSView(frame: NSRect(origin: .zero, size: p.frame.size))
+            host.wantsLayer = true
+            p.contentView = host
+            let directions: [RadialDirection] = [.up, .left, .right]
+            let items = actions.enumerated().map { index, action in
+                RadialItem(id: action.id, title: action.title,
+                           symbol: action.kind == .workflow ? "wand.and.stars" : action.kind == .open ? "arrow.up.forward.app" : "command",
+                           direction: directions[index])
+            }
+            p.radialMenu = RadialMenuView(items: items, appName: appName, defaultIndex: nil)
+            p.radialMenu?.useFloatingBackdrop()
+            radialOrigin = triggerPoint
+            radialLastPoint = triggerPoint
+            radialSelection = RadialSelection(center: triggerPoint, items: items, outerRadius: 230)
+            radialFeedback.reset()
+            radialCompression = holdUntilMouseUp ? PressureFeedback.minimumCompression : 0
+            let heading = label(appName, size: 12, weight: .medium, color: .secondaryLabelColor)
+            heading.alignment = .center
+            let caption = label("", size: 12, color: .secondaryLabelColor)
+            caption.alignment = .center
+            caption.maximumNumberOfLines = 2
+            caption.lineBreakMode = .byTruncatingTail
+            // Keep the action origin exactly under the pointer, including at screen edges.
+            p.setFrameOrigin(NSPoint(x: triggerPoint.x - 240, y: triggerPoint.y - 165))
+            let infoSurface = NSVisualEffectView(frame: NSRect(x: 56, y: 326, width: 368, height: 68))
+            infoSurface.material = .popover
+            infoSurface.blendingMode = .behindWindow
+            infoSurface.state = .active
+            infoSurface.wantsLayer = true
+            infoSurface.layer?.cornerRadius = 18
+            infoSurface.layer?.masksToBounds = true
+            host.addSubview(infoSurface)
+            heading.frame = NSRect(x: 68, y: 365, width: 344, height: 20)
+            caption.frame = NSRect(x: 68, y: 330, width: 344, height: 32)
+            host.addSubview(heading)
+            host.addSubview(caption)
+            menuInputLabel = caption
+            p.onRadialPoint = { [weak self] point, commit in
+                self?.updateRadialSelection(at: point)
+                if commit { self?.commitRadialSelection() }
+            }
+            p.onRadialKey = { [weak self] key in
+                guard let self else { return }
+                if key == 36 { self.commitRadialSelection(); return }
+                let offset: CGPoint = key == 123 ? CGPoint(x: -145, y: 0)
+                    : key == 124 ? CGPoint(x: 145, y: 0)
+                    : key == 126 ? CGPoint(x: 0, y: 118)
+                    : key == 125 ? CGPoint(x: 0, y: -118) : .zero
+                self.updateRadialSelection(at: NSPoint(x: self.radialOrigin.x + offset.x, y: self.radialOrigin.y + offset.y))
+            }
+        } else {
+            radialSelection = nil
+            let bg = NSVisualEffectView()
+            bg.material = .menu; bg.blendingMode = .behindWindow; bg.state = .active
+            bg.wantsLayer = true; bg.layer?.cornerRadius = 12; bg.layer?.masksToBounds = true
+            p.contentView = bg
+            let caption = label("", size: 12, color: .secondaryLabelColor)
+            menuInputLabel = caption
+            var views: [NSView] = [label(appName, size: 18, weight: .semibold), caption]
+            for (index, action) in actions.enumerated() {
+                let row = button("\(index + 1)   \(action.title)", self, #selector(configuredAction(_:)))
+                row.tag = index + 1; row.alignment = .left; row.lineBreakMode = .byTruncatingTail
+                menuInputButtons.append(row); views.append(row)
+            }
+            let configure = button("配置…", self, #selector(showProfileSettings))
+            views.append(stack([label("数字选择 · Esc 关闭", size: 11, color: .secondaryLabelColor), configure], vertical: false, spacing: 16))
+            let content = stack(views, spacing: 10)
+            content.translatesAutoresizingMaskIntoConstraints = false; bg.addSubview(content)
+            NSLayoutConstraint.activate([content.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 20),
+                                         content.topAnchor.constraint(equalTo: bg.topAnchor, constant: 16),
+                                         content.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -20)])
+            p.setFrameOrigin(NSPoint(x: min(max(visible.minX + 8, triggerPoint.x + 12), visible.maxX-p.frame.width-8),
+                                     y: min(max(visible.minY + 8, triggerPoint.y-p.frame.height-12), visible.maxY-p.frame.height-8)))
         }
-        let configure = button("配置…", self, #selector(showProfileSettings))
-        let footer = stack([label("数字选择 · Esc 关闭", size: 11, color: .secondaryLabelColor), configure], vertical: false, spacing: 16)
-        views.append(footer)
-        let content = stack(views, spacing: 10)
-        content.translatesAutoresizingMaskIntoConstraints = false
-        bg.addSubview(content)
-        NSLayoutConstraint.activate([content.leadingAnchor.constraint(equalTo: bg.leadingAnchor, constant: 20),
-                                     content.topAnchor.constraint(equalTo: bg.topAnchor, constant: 16),
-                                     content.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -20)])
         p.perform = { [weak self] n in self?.performAction(n) }
         p.onDismiss = { [weak self] in self?.dismissActionMenu(reason: "按 Esc") }
-        let triggerPoint = point ?? NSEvent.mouseLocation
-        var location = triggerPoint
-        let screen = NSScreen.screens.first(where: { $0.frame.contains(location) }) ?? NSScreen.main
-        let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1000, height: 800)
-        location.x = min(max(visible.minX + 8, location.x + 12), visible.maxX-p.frame.width-8)
-        location.y = min(max(visible.minY + 8, location.y-p.frame.height-12), visible.maxY-p.frame.height-8)
-        p.setFrameOrigin(location)
         panel = p
         menuPressHeld = holdUntilMouseUp && (NSEvent.pressedMouseButtons & 1) != 0
         p.setPressHeld(menuPressHeld)
+        refreshMenuInputState()
         p.present(from: triggerPoint)
+        if radial { p.radialMenu?.updateInteraction(displacement: .zero, compression: menuPressHeld ? PressureFeedback.minimumCompression : 0) }
         menusShown += 1
         addLine("动作菜单已显示：\(origin) · \(appName)。")
+        guard actions.contains(where: { $0.inputRequirement != .none }), menuContext == nil else { return }
+        guard let target else {
+            menuContext = ActionContext(sourcePID: 0, sourceBundleID: bundleID, sourceName: appName,
+                                        capturedAt: Date(), selectedText: nil, fileURLs: [], unavailableReason: "找不到原来的 App。")
+            refreshMenuInputState(); return
+        }
+        if holdUntilMouseUp, gestureCaptureID != nil { return }
+        selectionProvider.currentSelection(for: target) { [weak self] context in
+            guard let self, self.menuCaptureID == captureID, self.panel?.isVisible == true else { return }
+            self.menuContext = context; self.refreshMenuInputState()
+        }
+    }
+
+    func refreshMenuInputState() {
+        let states = menuActions.map { action -> ActionAvailability in
+            if action.inputRequirement == .none { return ActionAvailability(isAvailable: true, reason: nil) }
+            return menuContext?.availability(for: action.inputRequirement)
+                ?? ActionAvailability(isAvailable: false, reason: "正在读取选中内容…")
+        }
+        for (index, row) in menuInputButtons.enumerated() {
+            row.isEnabled = states[index].isAvailable
+            row.toolTip = states[index].reason ?? menuActions[index].inputRequirement.displayName
+        }
+        panel?.radialMenu?.setAvailability(states.map { $0.isAvailable })
+        if let text = menuContext?.selectedText, !text.isEmpty {
+            menuInputLabel?.stringValue = "选中 \(text.count) 字 · \(text.prefix(36).replacingOccurrences(of: "\n", with: " "))"
+        } else if let files = menuContext?.fileURLs, !files.isEmpty {
+            menuInputLabel?.stringValue = files.count == 1 ? files[0].lastPathComponent : "已选 \(files.count) 个文件"
+        } else if menuActions.contains(where: { $0.inputRequirement != .none }) {
+            menuInputLabel?.stringValue = menuContext?.unavailableReason ?? (menuContext == nil ? "正在读取选中内容…" : "请先在原 App 中选中文字或文件")
+        } else { menuInputLabel?.stringValue = "按住滑选 · 松手执行 · 回中央取消" }
+        if let selection = radialSelection {
+            panel?.radialMenu?.update(focus: selection.focus, hasLeftCenter: selection.hasLeftCenter)
+        }
+    }
+
+    func captureSelectionForGesture(in app: NSRunningApplication?) {
+        gestureSelection = nil
+        let id = UUID(); gestureCaptureID = id
+        guard let app, configurationStore.configuration.profile(for: app.bundleIdentifier ?? "")?.actions.contains(where: { $0.isEnabled && $0.inputRequirement != .none }) == true else { return }
+        selectionProvider.lockSelection(for: app) { [weak self] context in
+            guard let self else { return }
+            if self.gestureCaptureID == id { self.gestureSelection = context }
+            if self.menuGestureCaptureID == id, self.menuTargetApp?.processIdentifier == context.sourcePID, self.panel?.isVisible == true {
+                self.menuContext = context; self.refreshMenuInputState()
+            }
+        }
+    }
+
+    func updateRadialSelection(at point: NSPoint) {
+        guard var selection = radialSelection, let view = panel?.radialMenu else { return }
+        radialLastPoint = point
+        let previous = selection.focus
+        let focus = selection.update(point)
+        radialSelection = selection
+        view.update(focus: focus, hasLeftCenter: selection.hasLeftCenter)
+        view.updateInteraction(displacement: CGPoint(x: point.x - radialOrigin.x, y: point.y - radialOrigin.y), compression: radialCompression)
+        if case .action(let index) = focus, menuActions.indices.contains(index) {
+            let availability = menuContext?.availability(for: menuActions[index].inputRequirement)
+            if menuActions[index].inputRequirement != .none, availability?.isAvailable != true {
+                menuInputLabel?.stringValue = availability?.reason ?? "正在读取选中内容…"
+            } else {
+                menuInputLabel?.stringValue = "松手：\(menuActions[index].title)"
+                if previous != focus, menuPressHeld { NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now) }
+            }
+        } else { menuInputLabel?.stringValue = "松手取消" }
+    }
+
+    func updateRadialPressure(_ event: NSEvent) {
+        guard menuPressHeld, let view = panel?.radialMenu else { return }
+        radialCompression = radialFeedback.update(stage: event.stage, pressure: CGFloat(event.pressure))
+        view.updateInteraction(displacement: CGPoint(x: radialLastPoint.x - radialOrigin.x, y: radialLastPoint.y - radialOrigin.y), compression: radialCompression)
+    }
+
+    func commitRadialSelection() {
+        guard var selection = radialSelection else { return }
+        let index = selection.release()
+        radialSelection = nil
+        menuPressHeld = false
+        panel?.setPressHeld(false)
+        if let index { panel?.radialSelectedIndex = index; performAction(index + 1) }
+        else { dismissActionMenu(reason: "回中央取消") }
     }
 
     @objc func configuredAction(_ sender: NSButton) { performAction(sender.tag) }
@@ -1039,25 +1235,44 @@ final class LabController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func performAction(_ n: Int) {
         guard panel?.isVisible == true, !menuPressHeld, n > 0, n <= menuActions.count else { return }
         let action = menuActions[n - 1]
+        let context = action.inputRequirement == .none ? nil : menuContext
+        if action.inputRequirement != .none {
+            guard let availability = context?.availability(for: action.inputRequirement), availability.isAvailable else {
+                feedback.stringValue = context?.availability(for: action.inputRequirement).reason ?? "尚未取得动作需要的选中内容。"
+                dismissActionMenu(reason: "缺少所需输入")
+                return
+            }
+        }
         let target = menuTargetApp
+        let resultPoint = panel?.radialMenu != nil ? radialOrigin : NSEvent.mouseLocation
         let closingPanel = panel
         panel = nil
+        radialSelection = nil
+        menuContext = nil
+        menuInputLabel = nil
+        menuInputButtons = []
+        menuCaptureID = UUID()
+        menuGestureCaptureID = nil
+        gestureSelection = nil
+        gestureCaptureID = nil
         menuPressHeld = false
         closingPanel?.dismissWithMotion()
         cancelPendingMenu()
         configuredActionsSubmitted += 1
         feedback.stringValue = "正在执行：\(action.title)…"
-        actionExecutor.execute(action, target: target) { [weak self] result in
+        actionExecutor.execute(action, target: target, context: context) { [weak self] result in
             guard let self else { return }
             switch result {
             case .success(let message):
                 self.actionsCompleted += 1
                 self.feedback.stringValue = message
+                if action.inputRequirement != .none { self.actionResults.show(title: action.title, message: message, near: resultPoint) }
                 self.addLine("动作已执行：\(action.title)。")
             case .failure(let error):
                 self.configuredActionFailures += 1
                 self.feedback.stringValue = "\(action.title)：\(error.localizedDescription)"
-                self.addLine("动作失败：\(action.title) · \(error.localizedDescription)")
+                if action.inputRequirement != .none { self.actionResults.show(title: action.title, message: error.localizedDescription, near: resultPoint, isError: true) }
+                self.addLine("动作失败：\(action.title)。详细原因显示在窗口中。")
             }
             self.dirty = true
             self.refresh()
@@ -1161,7 +1376,7 @@ final class LabController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let events: [EventRecord]
         }
         let iso = ISO8601DateFormatter()
-        let report = Report(formatVersion: 3, appVersion: "1.0.0", startedAt: iso.string(from: startedAt),
+        let report = Report(formatVersion: 3, appVersion: "1.1.0-preview.1", startedAt: iso.string(from: startedAt),
                             exportedAt: iso.string(from: Date()), os: ProcessInfo.processInfo.operatingSystemVersionString,
                             globalMonitorInstalled: globalMonitor != nil, cgTapInstalled: tap != nil,
                             cgTapEnabled: tap.map { CGEvent.tapIsEnabled(tap: $0) } ?? false,
@@ -1202,7 +1417,7 @@ final class LabController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc func showWindow() { NSApp.activate(ignoringOtherApps: true); window.makeKeyAndOrderFront(nil) }
     @objc func showAbout() {
-        NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "按刻", .applicationVersion: "1.0.0",
+        NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "按刻", .applicationVersion: "1.1.0 预览",
                                                    .credits: NSAttributedString(string: "重按触控板，打开当前 App 的常用动作。\n快捷键、应用与网址、快捷指令，按需配置。")])
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -1231,6 +1446,8 @@ final class LabController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let workspaceObserver { NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver) }
         stopTap()
         actionExecutor.cancelAll()
+        actionResults.dismiss()
+        selectionProvider.stop()
         if let hotKey { UnregisterEventHotKey(hotKey) }
         if let menuHotKey { UnregisterEventHotKey(menuHotKey) }
         if let hotKeyHandler { RemoveEventHandler(hotKeyHandler) }

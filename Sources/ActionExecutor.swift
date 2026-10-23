@@ -6,47 +6,43 @@ private struct ActionExecutionError: LocalizedError {
     var errorDescription: String? { message }
 }
 
-private final class BoundedActionOutput {
-    private let lock = NSLock()
-    private var bytes = Data()
-    private let limit = 16_384
-
-    func append(_ data: Data) {
-        lock.lock()
-        defer { lock.unlock() }
-        let remaining = max(0, limit - bytes.count)
-        bytes.append(data.prefix(remaining))
-    }
-
-    func text() -> String {
-        lock.lock()
-        defer { lock.unlock() }
-        return String(decoding: bytes, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-}
-
 final class ActionExecutor {
     private struct Pending {
         let completion: (Result<String, Error>) -> Void
         var process: Process?
+        var payload: ActionInputPayload?
+        var timeout: DispatchWorkItem?
+        var readers: [ActionPipeReader]
     }
 
     // All mutable execution state is confined to the main queue.
     private var pending: [UUID: Pending] = [:]
+    private let workflowExecutableURL: URL
 
-    func execute(_ action: MenuAction, target: NSRunningApplication?, completion: @escaping (Result<String, Error>) -> Void) {
+    init(workflowExecutableURL: URL = URL(fileURLWithPath: "/usr/bin/shortcuts")) {
+        self.workflowExecutableURL = workflowExecutableURL
+    }
+
+    func execute(_ action: MenuAction, target: NSRunningApplication?, context: ActionContext? = nil,
+                 completion: @escaping (Result<String, Error>) -> Void) {
         onMain { [weak self] in
             guard let self = self else { return }
             guard action.isEnabled else {
                 completion(.failure(ActionExecutionError(message: "这个动作尚未启用。")))
                 return
             }
+            do {
+                try ActionInputPayload.validate(action.inputRequirement, context: context, targetPID: target?.processIdentifier)
+            } catch {
+                completion(.failure(error))
+                return
+            }
             let id = UUID()
-            self.pending[id] = Pending(completion: completion, process: nil)
+            self.pending[id] = Pending(completion: completion, process: nil, payload: nil, timeout: nil, readers: [])
             switch action.kind {
             case .shortcut: self.executeShortcut(action, target: target, id: id)
-            case .open: self.executeOpen(action, id: id)
-            case .workflow: self.executeWorkflow(action, id: id)
+            case .open: self.executeOpen(action, context: context, id: id)
+            case .workflow: self.executeWorkflow(action, context: context, targetPID: target?.processIdentifier, id: id)
             }
         }
     }
@@ -57,7 +53,10 @@ final class ActionExecutor {
             let cancelled = self.pending
             self.pending.removeAll()
             for item in cancelled.values {
+                item.timeout?.cancel()
                 if let process = item.process, process.isRunning { process.terminate() }
+                item.readers.forEach { $0.stop() }
+                item.payload?.cleanup()
                 item.completion(.failure(ActionExecutionError(message: "动作已取消。")))
             }
         }
@@ -147,7 +146,7 @@ final class ActionExecutor {
         return events
     }
 
-    private func executeOpen(_ action: MenuAction, id: UUID) {
+    private func executeOpen(_ action: MenuAction, context: ActionContext?, id: UUID) {
         let value = action.value.trimmingCharacters(in: .whitespacesAndNewlines)
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
@@ -164,6 +163,10 @@ final class ActionExecutor {
         }
         if let url = URL(string: value), let scheme = url.scheme?.lowercased(),
            ["http", "https"].contains(scheme), let host = url.host, !host.isEmpty {
+            guard action.inputRequirement == .none else {
+                fail(id, "网址动作暂不支持接收所选内容，请改为打开应用或运行快捷指令。")
+                return
+            }
             NSWorkspace.shared.open(url, configuration: configuration, completionHandler: callback)
             return
         }
@@ -186,35 +189,66 @@ final class ActionExecutor {
             fail(id, "找不到这个应用。请填写应用标识、完整 .app 路径或 http/https 网址。")
             return
         }
-        NSWorkspace.shared.openApplication(at: url, configuration: configuration, completionHandler: callback)
+        switch action.inputRequirement {
+        case .none:
+            NSWorkspace.shared.openApplication(at: url, configuration: configuration, completionHandler: callback)
+        case .selectedText:
+            fail(id, "打开应用暂不支持传入文字，请使用快捷指令接收所选文字。")
+        case .selectedFiles, .selectedImages:
+            let selected = context?.fileURLs ?? []
+            guard !selected.isEmpty,
+                  selected.allSatisfy({ $0.isFileURL && FileManager.default.isReadableFile(atPath: $0.path) }) else {
+                fail(id, "所选文件已移动或无法读取，请重新选择后再试。")
+                return
+            }
+            NSWorkspace.shared.open(selected, withApplicationAt: url, configuration: configuration, completionHandler: callback)
+        }
     }
 
-    private func executeWorkflow(_ action: MenuAction, id: UUID) {
+    private func executeWorkflow(_ action: MenuAction, context: ActionContext?, targetPID: Int32?, id: UUID) {
         let name = action.value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty, !name.contains("\0") else {
             fail(id, "请填写要运行的快捷指令名称。")
             return
         }
-        guard FileManager.default.isExecutableFile(atPath: "/usr/bin/shortcuts") else {
+        guard workflowExecutableURL.isFileURL,
+              FileManager.default.isExecutableFile(atPath: workflowExecutableURL.path) else {
             fail(id, "当前系统无法运行快捷指令。")
             return
         }
+        let payload: ActionInputPayload
+        let arguments: [String]
+        do {
+            payload = try ActionInputPayload.prepare(action.inputRequirement, context: context, targetPID: targetPID)
+            arguments = try payload.workflowArguments(name: name)
+            pending[id]?.payload = payload
+        } catch {
+            fail(id, error.localizedDescription)
+            return
+        }
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/shortcuts")
-        process.arguments = ["run", name]
+        process.executableURL = workflowExecutableURL
+        process.arguments = arguments
         process.standardInput = FileHandle.nullDevice
-        process.standardOutput = FileHandle.nullDevice
         let stderr = Pipe()
+        let stdout = Pipe()
+        let errors = BoundedActionOutput()
         let output = BoundedActionOutput()
         let drained = DispatchGroup()
         process.standardError = stderr
-        drained.enter()
+        process.standardOutput = stdout
+        let readers = [ActionPipeReader(handle: stderr.fileHandleForReading, output: errors, group: drained),
+                       ActionPipeReader(handle: stdout.fileHandleForReading, output: output, group: drained)]
+        pending[id]?.readers = readers
         process.terminationHandler = { [weak self] terminated in
-            drained.wait()
-            let detail = output.text()
+            // Both readers run off the main queue. Descendants retaining a pipe
+            // must not postpone completion indefinitely after the launcher exits.
+            _ = drained.wait(timeout: .now() + 2)
+            let detail = errors.text()
+            let result = output.displayedText()
             self?.onMain { [weak self] in
                 if terminated.terminationReason == .exit && terminated.terminationStatus == 0 {
-                    self?.finish(id, .success("快捷指令已完成。"))
+                    self?.finish(id, .success(result.map { "快捷指令已完成。\n\($0)" } ?? "快捷指令已完成。"))
                 } else {
                     self?.fail(id, detail.isEmpty ? "快捷指令未完成，请在“快捷指令”App 中检查名称和运行权限。" : "快捷指令未完成：\(detail)")
                 }
@@ -224,29 +258,27 @@ final class ActionExecutor {
         do {
             try process.run()
             try? stderr.fileHandleForWriting.close()
-            DispatchQueue.global(qos: .utility).async {
-                defer {
-                    try? stderr.fileHandleForReading.close()
-                    drained.leave()
-                }
-                do {
-                    while let chunk = try stderr.fileHandleForReading.read(upToCount: 4096), !chunk.isEmpty {
-                        output.append(chunk)
-                    }
-                } catch {
-                    // The process status remains authoritative if the pipe closes early.
-                }
+            try? stdout.fileHandleForWriting.close()
+            let timeout = DispatchWorkItem { [weak self, weak process] in
+                guard let self, self.pending[id] != nil else { return }
+                if let process, process.isRunning { process.terminate() }
+                self.fail(id, "快捷指令运行超过两分钟，已请求停止。请在“快捷指令”App 中检查运行状态。")
             }
+            pending[id]?.timeout = timeout
+            DispatchQueue.main.asyncAfter(deadline: .now() + 120, execute: timeout)
         } catch {
             try? stderr.fileHandleForWriting.close()
-            try? stderr.fileHandleForReading.close()
-            drained.leave()
+            try? stdout.fileHandleForWriting.close()
+            readers.forEach { $0.stop() }
             fail(id, "无法启动快捷指令：\(error.localizedDescription)")
         }
     }
 
     private func finish(_ id: UUID, _ result: Result<String, Error>) {
         guard let item = pending.removeValue(forKey: id) else { return }
+        item.timeout?.cancel()
+        item.readers.forEach { $0.stop() }
+        item.payload?.cleanup()
         item.completion(result)
     }
 

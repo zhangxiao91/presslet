@@ -38,6 +38,115 @@ struct ActionConfigurationTestRunner {
         let decoded = try JSONDecoder().decode(ActionConfiguration.self, from: serialized)
         expect(decoded == disabled, "JSON round trip retains all fields")
 
+        let legacyActionJSON = Data(#"{"id":"old-copy","title":"Copy","kind":"shortcut","value":"cmd+c","isEnabled":true}"#.utf8)
+        let legacyAction = try JSONDecoder().decode(MenuAction.self, from: legacyActionJSON)
+        expect(legacyAction.inputRequirement == .none, "Actions saved before input support need no context")
+        expect(MenuAction(title: "Copy", kind: .shortcut, value: "cmd+c").inputRequirement == .none,
+               "Existing action initializers retain their behavior")
+        for requirement in ActionInputRequirement.allCases {
+            let action = MenuAction(title: "Process selection", kind: .workflow,
+                                    value: "My Shortcut", inputRequirement: requirement)
+            let actionData = try JSONEncoder().encode(action)
+            let roundTrip = try JSONDecoder().decode(MenuAction.self, from: actionData)
+            expect(roundTrip == action, "JSON preserves the \(requirement.rawValue) input requirement")
+            let actionObject = try JSONSerialization.jsonObject(with: actionData) as? [String: Any]
+            expect(actionObject?["inputRequirement"] as? String == requirement.rawValue,
+                   "Saved JSON explicitly records the input requirement")
+            expect(!requirement.displayName.isEmpty, "Every input requirement has a display name")
+        }
+        var configuredInput = disabled
+        configuredInput.profiles[0].actions[0].inputRequirement = .selectedText
+        try store.save(configuredInput)
+        expect(ActionConfigurationStore(url: url).configuration == configuredInput,
+               "Input requirements persist through store save and reload")
+        try store.save(disabled)
+
+        let legacyObject = try JSONSerialization.jsonObject(with: serialized) as! [String: Any]
+        var legacyConfiguration = legacyObject
+        var legacyProfiles = legacyObject["profiles"] as! [[String: Any]]
+        for profileIndex in legacyProfiles.indices {
+            var legacyActions = legacyProfiles[profileIndex]["actions"] as! [[String: Any]]
+            for actionIndex in legacyActions.indices { legacyActions[actionIndex].removeValue(forKey: "inputRequirement") }
+            legacyProfiles[profileIndex]["actions"] = legacyActions
+        }
+        legacyConfiguration["profiles"] = legacyProfiles
+        let legacyConfigurationData = try JSONSerialization.data(withJSONObject: legacyConfiguration)
+        let decodedLegacyConfiguration = try JSONDecoder().decode(ActionConfiguration.self, from: legacyConfigurationData)
+        expect(decodedLegacyConfiguration == disabled, "A complete legacy configuration loads without migration loss")
+        let unknownInputJSON = Data(#"{"id":"unknown","title":"Unknown","kind":"workflow","value":"Test","isEnabled":true,"inputRequirement":"future-type"}"#.utf8)
+        do {
+            _ = try JSONDecoder().decode(MenuAction.self, from: unknownInputJSON)
+            expect(false, "Unknown input requirements must not silently execute without input")
+        } catch { expect(true, "Unknown input requirements are rejected") }
+
+        func context(text: String? = nil, files: [URL] = [], pid: Int32 = 123,
+                     reason: String? = nil) -> ActionContext {
+            ActionContext(sourcePID: pid, sourceBundleID: "example.source", sourceName: "Source",
+                          capturedAt: Date(timeIntervalSince1970: 100), selectedText: text,
+                          fileURLs: files, unavailableReason: reason)
+        }
+        let noSelection = context()
+        expect(noSelection.availability(for: .none).isAvailable, "Actions without input remain available")
+        expect(context(pid: 0, reason: "Reading").availability(for: .none).isAvailable,
+               "No-input actions do not wait for content capture")
+        expect(!noSelection.availability(for: .selectedText).isAvailable, "Text actions require a selection")
+        expect(!noSelection.availability(for: .selectedFiles).isAvailable, "File actions require a selection")
+        expect(!noSelection.availability(for: .selectedImages).isAvailable, "Image actions require a selection")
+        expect(noSelection.availability(for: .selectedText).reason != nil, "Missing selection explains unavailability")
+        expect(context(text: " \n\t ").availability(for: .selectedText).isAvailable == false,
+               "Whitespace-only selection is empty")
+        let spacedText = "  Selected text\n"
+        let selectedTextContext = context(text: spacedText)
+        expect(selectedTextContext.availability(for: .selectedText).isAvailable,
+               "Actual selected text enables text actions")
+        expect(selectedTextContext.selectedText == spacedText, "Input text retains its original whitespace")
+        expect(selectedTextContext.availability(for: .selectedText).reason == nil,
+               "Available actions have no unavailable reason")
+        expect(context(reason: "正在读取所选内容…").availability(for: .selectedText).reason == "正在读取所选内容…",
+               "Providers can distinguish loading from an empty selection")
+        expect(context(reason: "此 App 暂不支持读取选区。").availability(for: .selectedText).reason == "此 App 暂不支持读取选区。",
+               "Providers can explain unsupported selection capture")
+        expect(context(text: "Selected", reason: "No files").availability(for: .selectedText).isAvailable,
+               "One available input type is not blocked by another missing type")
+        for pid: Int32 in [0, -1] {
+            expect(!context(text: "Selected", pid: pid).availability(for: .selectedText).isAvailable,
+                   "Context-dependent actions require a valid source process")
+        }
+
+        let imagesDirectory = directory.appendingPathComponent("image-inputs")
+        try FileManager.default.createDirectory(at: imagesDirectory, withIntermediateDirectories: true)
+        let png = imagesDirectory.appendingPathComponent("first.png")
+        let jpeg = imagesDirectory.appendingPathComponent("second.JPG")
+        let document = imagesDirectory.appendingPathComponent("notes.txt")
+        let imageNamedDirectory = imagesDirectory.appendingPathComponent("folder.png", isDirectory: true)
+        for file in [png, jpeg, document] { try Data().write(to: file) }
+        try FileManager.default.createDirectory(at: imageNamedDirectory, withIntermediateDirectories: true)
+        expect(context(files: [png]).availability(for: .selectedFiles).isAvailable,
+               "Image files can also be used as ordinary file input")
+        expect(context(files: [png, jpeg]).availability(for: .selectedImages).isAvailable,
+               "A selection consisting entirely of recognized image extensions is available")
+        expect(!context(files: [png, document]).availability(for: .selectedImages).isAvailable,
+               "Mixed image and document selections cannot run image-only actions")
+        expect(context(files: [png, document]).availability(for: .selectedFiles).isAvailable,
+               "Mixed local files remain valid ordinary file input")
+        expect(!context(files: [imageNamedDirectory]).availability(for: .selectedImages).isAvailable,
+               "Directories with image suffixes are not images")
+        expect(context(files: [imageNamedDirectory]).availability(for: .selectedFiles).isAvailable,
+               "A directory is valid Finder file input")
+        expect(!context(files: [imagesDirectory.appendingPathComponent("missing.png")]).availability(for: .selectedImages).isAvailable,
+               "A nonexistent image path cannot be confirmed as an image file")
+        let remoteImage = URL(string: "https://example.com/image.png")!
+        expect(!context(files: [remoteImage]).availability(for: .selectedImages).isAvailable,
+               "Remote image URLs are not selected local image files")
+        expect(!context(files: [remoteImage]).availability(for: .selectedFiles).isAvailable,
+               "Remote URLs are not local file input")
+        expect(!context(files: [png], pid: 0).availability(for: .selectedFiles).isAvailable,
+               "Selected file input also requires a valid source process")
+        expect(selectedTextContext.sourcePID == 123 && selectedTextContext.sourceBundleID == "example.source"
+                && selectedTextContext.sourceName == "Source"
+                && selectedTextContext.capturedAt == Date(timeIntervalSince1970: 100),
+               "Context retains its source identity and capture time")
+
         var duplicate = defaults
         duplicate.profiles.append(defaults.profiles[1])
         expect(duplicate.validationErrors.count >= 2, "Duplicate app and profile ids rejected")
@@ -136,6 +245,30 @@ struct ActionConfigurationTestRunner {
         expect(!workflow.validationErrors.isEmpty, "Blank workflow name rejected")
         workflow.profiles[0].actions[0].value = "foo\0bar"
         expect(!workflow.validationErrors.isEmpty, "Nul in workflow name rejected")
+        for requirement in ActionInputRequirement.allCases {
+            var configured = defaults
+            configured.profiles[0].actions = [MenuAction(title: "Workflow", kind: .workflow,
+                                                        value: "My Shortcut", inputRequirement: requirement)]
+            expect(configured.validationErrors.isEmpty, "Workflows support \(requirement.rawValue) input")
+            configured.profiles[0].actions = [MenuAction(title: "Shortcut", kind: .shortcut,
+                                                        value: "cmd+c", inputRequirement: requirement)]
+            expect(configured.validationErrors.isEmpty, "Keyboard shortcuts may use any input as a precondition")
+        }
+        var openInput = defaults
+        openInput.profiles[0].actions = [MenuAction(title: "Open text", kind: .open,
+                                                 value: "com.apple.TextEdit", inputRequirement: .selectedText)]
+        expect(!openInput.validationErrors.isEmpty, "Open actions cannot promise to consume selected text")
+        for requirement in [ActionInputRequirement.selectedFiles, .selectedImages] {
+            openInput.profiles[0].actions[0].inputRequirement = requirement
+            for appTarget in ["com.apple.Preview", "/Applications/Preview.app"] {
+                openInput.profiles[0].actions[0].value = appTarget
+                expect(openInput.validationErrors.isEmpty, "App targets can open selected local files or images")
+            }
+            for webTarget in ["https://example.com", "http://example.com"] {
+                openInput.profiles[0].actions[0].value = webTarget
+                expect(!openInput.validationErrors.isEmpty, "Web targets cannot consume selected local files or images")
+            }
+        }
         print("PASS: \(assertions) action configuration assertions")
     }
 }

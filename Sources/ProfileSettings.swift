@@ -16,6 +16,8 @@ private final class ProfileActionRow: NSView, NSTextFieldDelegate {
     let titleField = NSTextField()
     let valueField = NSTextField()
     let kindPopup = NSPopUpButton()
+    private let inputPopup = NSPopUpButton()
+    private let inputKinds = ActionInputRequirement.allCases
     let enabledButton = NSButton(checkboxWithTitle: "", target: nil, action: nil)
     private let help = settingsLabel("", size: 11, color: .secondaryLabelColor)
     private let upButton = NSButton(title: "↑", target: nil, action: nil)
@@ -43,6 +45,11 @@ private final class ProfileActionRow: NSView, NSTextFieldDelegate {
         kindPopup.selectItem(at: kinds.firstIndex(of: action.kind) ?? 0)
         kindPopup.target = self
         kindPopup.action = #selector(kindChanged)
+        inputPopup.addItems(withTitles: inputKinds.map { $0.displayName })
+        inputPopup.selectItem(at: inputKinds.firstIndex(of: action.inputRequirement) ?? 0)
+        inputPopup.target = self
+        inputPopup.action = #selector(inputChanged)
+        inputPopup.setAccessibilityLabel("动作 \(index + 1) 输入要求")
         enabledButton.state = action.isEnabled ? .on : .off
         enabledButton.target = self
         enabledButton.action = #selector(enabledChanged)
@@ -76,7 +83,9 @@ private final class ProfileActionRow: NSView, NSTextFieldDelegate {
         valueRow.spacing = 7
         valueRow.alignment = .centerY
         valueRow.detachesHiddenViews = true
-        let content = NSStackView(views: [heading, valueRow, help])
+        let inputRow = NSStackView(views: [settingsLabel("使用内容", size: 12, color: .secondaryLabelColor), inputPopup])
+        inputRow.spacing = 8
+        let content = NSStackView(views: [heading, valueRow, inputRow, help])
         content.orientation = .vertical
         content.alignment = .leading
         content.spacing = 5
@@ -104,18 +113,27 @@ private final class ProfileActionRow: NSView, NSTextFieldDelegate {
         switch action.kind {
         case .shortcut:
             valueField.placeholderString = "例如 cmd+l 或 cmd+shift+t"
-            help.stringValue = "组合键：cmd、option、ctrl、shift，加一个字母、数字或方向键。"
+            help.stringValue = "输入要求用于确认选区；快捷键仍发送给原 App，不会自动粘贴内容。"
         case .open:
             valueField.placeholderString = "网址、应用标识，或 .app 完整路径"
-            help.stringValue = "可直接选择应用，或填写网址，例如 https://www.apple.com。"
+            help.stringValue = action.inputRequirement == .none
+                ? "可选择应用或填写网址。选择文件输入后，会用指定应用打开这些文件。"
+                : "文件会交给指定应用打开；网址和文字输入不适用于此动作。"
         case .workflow:
             valueField.placeholderString = "快捷指令名称"
-            help.stringValue = "填写「快捷指令」App 中已有的名称，执行时会运行该快捷指令。"
+            help.stringValue = action.inputRequirement == .none
+                ? "运行「快捷指令」App 中已有的同名快捷指令。"
+                : "将选中的内容作为输入传给同名快捷指令；请在快捷指令中接收文字或文件。"
         }
     }
     func controlTextDidChange(_ obj: Notification) {
         action.title = titleField.stringValue
         action.value = valueField.stringValue
+        onChange?(action)
+    }
+    @objc private func inputChanged() {
+        action.inputRequirement = inputKinds[inputPopup.indexOfSelectedItem]
+        refreshHelp()
         onChange?(action)
     }
     @objc private func kindChanged() {
@@ -148,6 +166,8 @@ private final class ProfileActionRow: NSView, NSTextFieldDelegate {
 
 final class ProfileSettingsController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate, NSWindowDelegate {
     var onPreview: ((AppProfile) -> Void)?
+    var onRequestFinderAccess: (() -> Void)?
+    private let finderAccessButton = NSButton(title: "允许读取 Finder 选中文件…", target: nil, action: nil)
     private var configuration: ActionConfiguration
     private var savedConfiguration: ActionConfiguration
     private let onSave: (ActionConfiguration) throws -> Void
@@ -259,7 +279,10 @@ final class ProfileSettingsController: NSWindowController, NSTableViewDataSource
         let interceptHelp = settingsLabel("开启后由按刻处理重按，避免同时出现系统查词或预览。", size: 11, color: .secondaryLabelColor)
         let sectionTitle = settingsLabel("菜单动作", size: 13)
         sectionTitle.font = .systemFont(ofSize: 13, weight: .semibold)
-        let actionHeader = NSStackView(views: [sectionTitle, actionCount])
+        finderAccessButton.target = self
+        finderAccessButton.action = #selector(requestFinderAccess)
+        finderAccessButton.bezelStyle = .rounded
+        let actionHeader = NSStackView(views: [sectionTitle, actionCount, finderAccessButton])
         actionHeader.orientation = .horizontal
         actionHeader.spacing = 12
         actionStack.orientation = .vertical
@@ -319,6 +342,7 @@ final class ProfileSettingsController: NSWindowController, NSTableViewDataSource
         table.selectRowIndexes(IndexSet(integer: selectedIndex), byExtendingSelection: false)
     }
 
+    @objc private func requestFinderAccess() { onRequestFinderAccess?() }
     func numberOfRows(in tableView: NSTableView) -> Int { configuration.profiles.count }
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard configuration.profiles.indices.contains(row) else { return nil }
@@ -340,6 +364,7 @@ final class ProfileSettingsController: NSWindowController, NSTableViewDataSource
     private func refreshProfile() {
         guard configuration.profiles.indices.contains(selectedIndex) else { return }
         let profile = configuration.profiles[selectedIndex]
+        finderAccessButton.isHidden = profile.bundleID != "com.apple.finder"
         nameField.stringValue = profile.appName
         appIDLabel.stringValue = profile.bundleID == "*" ? "其他 App 的默认菜单" : profile.bundleID
         enabledButton.state = profile.isEnabled ? .on : .off

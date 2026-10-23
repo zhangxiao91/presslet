@@ -3,6 +3,10 @@ import QuartzCore
 
 final class ActionPanel: NSPanel {
     var perform: ((Int) -> Void)?
+    var radialMenu: RadialMenuView?
+    var radialSelectedIndex: Int?
+    var onRadialPoint: ((NSPoint, Bool) -> Void)?
+    var onRadialKey: ((UInt16) -> Void)?
     var actionCount = 3
     var onDismiss: (() -> Void)?
     private var motionGeneration = 0
@@ -15,17 +19,25 @@ final class ActionPanel: NSPanel {
     private let enterDuration: TimeInterval = 0.32
     private let exitDuration: TimeInterval = 0.22
 
-    override var canBecomeKey: Bool { true }
+    override var canBecomeKey: Bool { radialMenu == nil || !pressHeld }
     override var canBecomeMain: Bool { false }
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 { onDismiss?(); return }
         guard !pressHeld, !dismissing else { return }
+        if radialMenu != nil, [UInt16(123), 124, 125, 126, 36, 49].contains(event.keyCode) {
+            onRadialKey?(event.keyCode); return
+        }
         if let c = event.charactersIgnoringModifiers, let n = Int(c), (1...max(1, actionCount)).contains(n) {
             perform?(n)
         } else { super.keyDown(with: event) }
     }
 
+    override func mouseDown(with event: NSEvent) {
+        if radialMenu != nil, !pressHeld, !dismissing {
+            onRadialPoint?(convertPoint(toScreen: event.locationInWindow), true)
+        } else { super.mouseDown(with: event) }
+    }
     func setPressHeld(_ held: Bool) {
         pressHeld = held
         ignoresMouseEvents = held || dismissing
@@ -39,6 +51,12 @@ final class ActionPanel: NSPanel {
         animationBehavior = .none
         ignoresMouseEvents = pressHeld
         contentView?.layoutSubtreeIfNeeded()
+        if let radialMenu, let host = contentView {
+            alphaValue = 1
+            if pressHeld { orderFrontRegardless() } else { makeKeyAndOrderFront(nil) }
+            radialMenu.present(at: NSPoint(x: screenPoint.x - frame.minX, y: screenPoint.y - frame.minY), in: host)
+            return
+        }
         if let layer = contentView?.layer {
             let anchor = CGPoint(x: min(1, max(0, (screenPoint.x - frame.minX) / frame.width)),
                                  y: min(1, max(0, (screenPoint.y - frame.minY) / frame.height)))
@@ -71,6 +89,14 @@ final class ActionPanel: NSPanel {
         Self.retiringPanel?.orderOut(nil)
         Self.retiringPanel = self
         ignoresMouseEvents = true
+        if let radialMenu {
+            radialMenu.dismiss(selectedIndex: radialSelectedIndex) { [self] in
+                guard self.motionGeneration == generation else { return }
+                self.orderOut(nil)
+                if Self.retiringPanel === self { Self.retiringPanel = nil }
+            }
+            return
+        }
         let reduced = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         if !reduced, let layer = contentView?.layer {
             scale(from: layer.presentation()?.transform ?? layer.transform,

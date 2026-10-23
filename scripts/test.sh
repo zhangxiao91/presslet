@@ -5,7 +5,7 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TEST_BUILD_DIR="$PROJECT_DIR/build/tests"
 mkdir -p "$TEST_BUILD_DIR" "$PROJECT_DIR/build/module-cache"
 
-for TEST_SOURCE in "$PROJECT_DIR"/Tests/*Tests.swift; do
+for TEST_SOURCE in "$PROJECT_DIR"/Tests/*Tests.swift "$PROJECT_DIR"/Prototypes/RadialPreview/*Tests.swift; do
   TEST_NAME="$(basename "$TEST_SOURCE" .swift)"
   TEST_SOURCES=()
   case "$TEST_NAME" in
@@ -16,7 +16,19 @@ for TEST_SOURCE in "$PROJECT_DIR"/Tests/*Tests.swift; do
       TEST_SOURCES+=("$PROJECT_DIR/Sources/PressMenuGate.swift")
       ;;
     ActionConfigurationTests|ConfigurationMigrationTests)
-      TEST_SOURCES+=("$PROJECT_DIR/Sources/ActionConfiguration.swift")
+      TEST_SOURCES+=("$PROJECT_DIR/Sources/ActionConfiguration.swift" "$PROJECT_DIR/Sources/ActionContext.swift")
+      ;;
+    ActionExecutorInputTests)
+      TEST_SOURCES+=("$PROJECT_DIR/Sources/ActionConfiguration.swift" "$PROJECT_DIR/Sources/ActionContext.swift" "$PROJECT_DIR/Sources/ActionInputPayload.swift")
+      ;;
+    ActionExecutorProcessTests)
+      TEST_SOURCES+=("$PROJECT_DIR/Sources/ActionConfiguration.swift" "$PROJECT_DIR/Sources/ActionContext.swift" "$PROJECT_DIR/Sources/ActionInputPayload.swift" "$PROJECT_DIR/Sources/ActionExecutor.swift")
+      ;;
+    RadialSelectionTests)
+      TEST_SOURCES+=("$PROJECT_DIR/Prototypes/RadialPreview/RadialSelection.swift")
+      ;;
+    PressureFeedbackTests)
+      TEST_SOURCES+=("$PROJECT_DIR/Prototypes/RadialPreview/PressureFeedback.swift")
       ;;
     *)
       printf 'Add source dependencies for %s in scripts/test.sh\n' "$TEST_NAME" >&2
