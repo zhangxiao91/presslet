@@ -4,6 +4,7 @@ final class ActionPanel: NSPanel {
     var perform: ((Int) -> Void)?
     var radialMenu: RadialMenuView?
     var radialSelectedIndex: Int?
+    var radialReleased = false
     var onRadialPoint: ((NSPoint, Bool) -> Void)?
     var onRadialKey: ((UInt16) -> Void)?
     var actionCount = 3
@@ -66,7 +67,7 @@ final class ActionPanel: NSPanel {
         Self.retiringPanel = self
         ignoresMouseEvents = true
         guard let radialMenu else { orderOut(nil); return }
-        radialMenu.dismiss(selectedIndex: radialSelectedIndex) { [self] in
+        radialMenu.dismiss(selectedIndex: radialSelectedIndex, released: radialReleased) { [self] in
             guard self.motionGeneration == generation else { return }
             self.orderOut(nil)
             if Self.retiringPanel === self { Self.retiringPanel = nil }

@@ -98,7 +98,11 @@ extension LabController {
         case .leftMouseUp:
             type = "mouseUp"
             _ = cycles[source]?.accept(.mouseUp)
-            releaseMenu(source: source, confirmedMouseUp: true, point: screenPoint(for: event))
+            // A tap-owned release uses its untouched physical sample. Monitors
+            // may see the relocated system release and must not commit it again.
+            if !inputState.hasTap {
+                releaseMenu(source: source, confirmedMouseUp: true, point: screenPoint(for: event))
+            }
             if !inputState.hasTap { suppressGestureUntilUp = false }
         case .leftMouseDragged:
             type = "mouseDragged"

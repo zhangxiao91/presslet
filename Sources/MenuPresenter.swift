@@ -83,7 +83,7 @@ final class MenuPresenter: NSObject {
         p.radialMenu?.useFloatingBackdrop()
         p.radialMenu?.onClick = { [weak self] index in self?.performAction(index + 1) }
         p.radialMenu?.onCancel = { [weak self] in self?.dismiss(reason: "取消") }
-        radialSelection = RadialSelection(center: radialOrigin, items: items, outerRadius: actions.count <= 3 ? 230 : 310)
+        radialSelection = RadialSelection(center: radialOrigin, items: items, outerRadius: RadialItem.menuOuterRadius(count: actions.count))
         radialFeedback.reset()
         radialCompression = held ? PressureFeedback.minimumCompression : 0
         let heading = label(appName, size: 12, weight: .medium, color: .secondaryLabelColor)
@@ -100,7 +100,8 @@ final class MenuPresenter: NSObject {
         infoSurface.blendingMode = .behindWindow
         infoSurface.state = .active
         infoSurface.wantsLayer = true
-        infoSurface.layer?.cornerRadius = 18
+        infoSurface.layer?.cornerRadius = 16
+        infoSurface.layer?.cornerCurve = .continuous
         infoSurface.layer?.masksToBounds = true
         host.addSubview(infoSurface)
         heading.frame = NSRect(x: infoX + 32, y: infoY + 39, width: infoWidth - 64, height: 20)
@@ -166,7 +167,12 @@ final class MenuPresenter: NSObject {
                     NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
                 }
             }
-        } else { inputLabel?.stringValue = "松手取消" }
+        } else {
+            inputLabel?.stringValue = "松手取消"
+            if previous != focus, focus == .center, pressHeld {
+                NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+            }
+        }
     }
 
     func updatePressure(_ event: NSEvent) {
@@ -239,6 +245,7 @@ final class MenuPresenter: NSObject {
         let index = selection.release()
         radialSelection = nil
         pressHeld = false
+        panel?.radialReleased = true
         panel?.setPressHeld(false)
         if let index { performAction(index + 1) }
         else { dismiss(reason: "回中央取消") }

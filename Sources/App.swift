@@ -178,12 +178,15 @@ final class LabController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let intercepted = Set(NSWorkspace.shared.runningApplications.compactMap { app -> Int32? in
             actionProvider.shouldIntercept(bundleID: app.bundleIdentifier ?? "") ? app.processIdentifier : nil
         })
+        let menuPIDs = Set(NSWorkspace.shared.runningApplications.compactMap { app -> Int32? in
+            actionProvider.hasActions(bundleID: app.bundleIdentifier ?? "") ? app.processIdentifier : nil
+        })
         inputManager.updatePolicy(PressureInputPolicy(enabled: observationRequested, paused: isPaused,
             autoMenu: menuOnRelease.state == .on, gestureEnabled: gestureEnabled.state == .on,
             overlayVisible: captureOverlay.isVisible, menuVisible: menuPresenter.isVisible,
             ownPID: ProcessInfo.processInfo.processIdentifier,
             frontmostPID: NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0,
-            interceptedPIDs: intercepted))
+            interceptedPIDs: intercepted, menuPIDs: menuPIDs))
     }
 
     @objc func toggleObservation() {
@@ -208,7 +211,7 @@ final class LabController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc func retryTap() {
         if !observationRequested { toggleObservation(); return }
-        cancelPendingMenu(); contextResolver.cancel(); updateInputPolicy(); inputManager.retry()
+        dismissActionMenu(reason: "重新连接输入"); cancelCycles(); updateInputPolicy(); inputManager.retry()
         inputState = inputManager.connectionState
     }
 
@@ -293,7 +296,12 @@ final class LabController: NSObject, NSApplicationDelegate, NSWindowDelegate {
            let settingsWindow = settings.window, !settings.windowShouldClose(settingsWindow) {
             return .terminateCancel
         }
-        return .terminateNow
+        // Stop accepting new gestures and decide whether to wait under the input
+        // manager's lock. A separate isActive check races with a new deep press.
+        observationRequested = false
+        dismissActionMenu(reason: "退出按刻")
+        inputManager.stop(afterRelease: { NSApp.reply(toApplicationShouldTerminate: true) })
+        return .terminateLater
     }
 }
 

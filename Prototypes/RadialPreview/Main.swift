@@ -226,7 +226,7 @@ private final class PreviewCanvas: NSView {
         if let chosen { onStatus?("已选择：\(scenes[sceneIndex].actions[chosen].title)") }
         else { onStatus?("已取消 · 再按一次试试") }
         let closing = radialMenu; radialMenu = nil
-        closing?.dismiss(selectedIndex: chosen) {}
+        closing?.dismiss(selectedIndex: chosen, released: true) {}
     }
     func cancel() {
         feedbackTimer?.invalidate(); feedbackTimer = nil

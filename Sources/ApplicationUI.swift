@@ -165,7 +165,8 @@ extension LabController {
     @objc func showWindow() { NSApp.activate(ignoringOtherApps: true); window.makeKeyAndOrderFront(nil) }
 
     @objc func showAbout() {
-        NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "按刻", .applicationVersion: "1.1.0",
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+        NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "按刻", .applicationVersion: version,
                                                    .credits: NSAttributedString(string: "重按触控板，打开当前 App 的常用动作。\n快捷键、应用与网址、快捷指令，按需配置。")])
     }
 

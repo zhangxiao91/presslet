@@ -137,6 +137,8 @@ extension LabController {
         struct Report: Encodable {
             let formatVersion: Int
             let appVersion: String
+            let appBuild: String
+            let mouseReleaseDelivery: String
             let startedAt: String
             let exportedAt: String
             let os: String
@@ -154,6 +156,8 @@ extension LabController {
             let edgeTakeoverSelected: Bool
             let blockedPressureEvents: Int
             let blockedPresses: Int
+            let blockedDragEvents: Int
+            let pairedMouseUps: Int
             let isPaused: Bool
             let primaryInput: String
             let autoMenuEnabled: Bool
@@ -187,7 +191,11 @@ extension LabController {
             let events: [EventRecord]
         }
         let iso = ISO8601DateFormatter()
-        let report = Report(formatVersion: 3, appVersion: "1.1.0", startedAt: iso.string(from: startedAt),
+        let report = Report(formatVersion: 4,
+                            appVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown",
+                            appBuild: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown",
+                            mouseReleaseDelivery: "The original physical mouse-up continues through the session tap at the last passed-through position. pairedMouseUps counts tap returns, not confirmed application receipt.",
+                            startedAt: iso.string(from: startedAt),
                             exportedAt: iso.string(from: Date()), os: ProcessInfo.processInfo.operatingSystemVersionString,
                             globalMonitorInstalled: inputState.hasGlobalMonitor, cgTapInstalled: inputState.hasTap,
                             cgTapEnabled: inputState.tapEnabled,
@@ -200,11 +208,13 @@ extension LabController {
                             menuProfileBundleID: menuProfileBundleID,
                             edgeTakeoverSelected: shouldIntercept(bundleID: "com.microsoft.edgemac"),
                             blockedPressureEvents: blockedPressureEvents, blockedPresses: blockedPresses,
+                            blockedDragEvents: max(0, inputManager.stats.blockedDragEvents - inputStatsStart.blockedDragEvents),
+                            pairedMouseUps: max(0, inputManager.stats.pairedMouseUps - inputStatsStart.pairedMouseUps),
                             isPaused: isPaused,
                             primaryInput: "gestureTap", autoMenuEnabled: menuOnRelease.state == .on,
                             primaryPressureEvents: gestureSamples, primaryDeepPresses: gestureDeep,
                             menusShown: menusShown, pressMenusShown: pressMenusShown, actionsCompleted: actionsCompleted,
-                            menuMotion: "glass radial expansion for 1-9 actions; enter 320ms; exit 220ms; pressure compression and directional attraction; reduced motion supported",
+                            menuMotion: "compact glass layout for 1-9 actions; continuous 17pt action corners; enter 320ms; exit 220ms; display-linked velocity-preserving pressure and attraction springs; fixed cancel target with depression and release rebound; reduced motion supported",
                             menuTrigger: "first stage 2; ordered asynchronous main-queue delivery before mouse release; response measured from the native event timestamp through presentation submission, including queue delay, not displayed-frame latency",
                             menuResponseLastMilliseconds: menuResponseMilliseconds.last,
                             menuResponseAverageMilliseconds: menuResponseMilliseconds.isEmpty ? nil : menuResponseMilliseconds.reduce(0, +) / Double(menuResponseMilliseconds.count),

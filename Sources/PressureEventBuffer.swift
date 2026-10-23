@@ -10,6 +10,7 @@ struct PressureInputPolicy: Equatable {
     var ownPID: Int32 = 0
     var frontmostPID: Int32 = 0
     var interceptedPIDs: Set<Int32> = []
+    var menuPIDs: Set<Int32> = []
 }
 
 struct PressureInputStats: Equatable {
@@ -17,6 +18,8 @@ struct PressureInputStats: Equatable {
     var blockedPresses = 0
     var rawGestureEvents = 0
     var overflows = 0
+    var blockedDragEvents = 0
+    var pairedMouseUps = 0
 }
 
 struct PressureFilterDecision: Equatable {
@@ -51,6 +54,9 @@ struct PressureInputFilter {
     mutating func rawGesture(policy: PressureInputPolicy) {
         if policy.enabled && !policy.paused && policy.gestureEnabled { stats.rawGestureEvents += 1 }
     }
+
+    mutating func recordBlockedDrag() { stats.blockedDragEvents += 1 }
+    mutating func recordPairedMouseUp() { stats.pairedMouseUps += 1 }
 
     mutating func recordOverflow() {
         stats.overflows += 1

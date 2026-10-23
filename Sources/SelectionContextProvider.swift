@@ -7,7 +7,7 @@ final class SelectionContextProvider {
     /// Set on the main queue. Applications without an input action should return false.
     var shouldObserve: ((String) -> Bool)?
 
-    private struct Source {
+    struct Source {
         let pid: pid_t
         let bundleID: String
         let name: String
@@ -19,48 +19,41 @@ final class SelectionContextProvider {
             CFEqual(window, other.window) && CFEqual(element, other.element)
         }
     }
-    private struct Cached {
-        let source: Source
-        let identity: Identity
-        let context: ActionContext
-    }
-
     private let queue = DispatchQueue(label: "dev.zxlab.Presslet.selection", qos: .userInitiated)
-    // AX objects and selected content are confined to queue.
-    private var cached: Cached?
-    private var observer: AXObserver?
-    private var observerApp: AXUIElement?
-    private var observerElement: AXUIElement?
-    private var observerPID: pid_t?
-    private var workerGeneration: UInt64 = 0
-    // Lifecycle and application snapshots are confined to the main queue.
+    private let frontmostPID: () -> pid_t?
+    private let notificationCenter: NotificationCenter
+    // A reader can be supplied for tests without querying another application's AX server.
+    private let selectionReader: ((Source) -> ActionContext)?
+    // Lifecycle state is confined to the main queue; AX reads run only on queue.
     private var activationToken: NSObjectProtocol?
-    private var timer: Timer?
     private var generation: UInt64 = 0
     private var running = false
-    private var pollPending = false
     private let textLimit = 1_048_576
     private let fileLimit = 100
 
+    init(frontmostPID: @escaping () -> pid_t? = { NSWorkspace.shared.frontmostApplication?.processIdentifier },
+         notificationCenter: NotificationCenter = NSWorkspace.shared.notificationCenter,
+         selectionReader: ((Source) -> ActionContext)? = nil) {
+        self.frontmostPID = frontmostPID
+        self.notificationCenter = notificationCenter
+        self.selectionReader = selectionReader
+    }
+
     deinit {
-        timer?.invalidate()
-        if let activationToken { NSWorkspace.shared.notificationCenter.removeObserver(activationToken) }
-        if let observer {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
-        }
+        if let activationToken { notificationCenter.removeObserver(activationToken) }
     }
 
     func start() {
         onMain { [weak self] in
             guard let self, !self.running else { return }
             self.running = true
-            self.activationToken = NSWorkspace.shared.notificationCenter.addObserver(
+            self.generation &+= 1
+            self.activationToken = self.notificationCenter.addObserver(
                 forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
-            ) { [weak self] _ in self?.activeApplicationChanged() }
-            self.timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
-                self?.pollActiveApplication()
+            ) { [weak self] _ in
+                guard let self else { return }
+                self.generation &+= 1
             }
-            self.activeApplicationChanged()
         }
     }
 
@@ -68,28 +61,20 @@ final class SelectionContextProvider {
         onMain { [weak self] in
             guard let self else { return }
             self.running = false
-            self.timer?.invalidate()
-            self.timer = nil
-            if let token = self.activationToken { NSWorkspace.shared.notificationCenter.removeObserver(token) }
+            if let token = self.activationToken { self.notificationCenter.removeObserver(token) }
             self.activationToken = nil
             self.generation &+= 1
-            let version = self.generation
-            self.queue.async {
-                self.workerGeneration = version
-                self.cached = nil
-                self.removeAXObserver()
-            }
         }
     }
 
     /// Call at mouse-down. Completion is asynchronous on the main queue.
-    /// A fresh cache may survive the click only when both window and focus still match.
+    /// Always read the current selection; only ContextResolver retains a result for this gesture.
     func lockSelection(for app: NSRunningApplication, completion: @escaping (ActionContext) -> Void) {
-        read(app: app, allowCached: true, completion: completion)
+        read(app: app, completion: completion)
     }
 
     func currentSelection(for app: NSRunningApplication, completion: @escaping (ActionContext) -> Void) {
-        read(app: app, allowCached: false, completion: completion)
+        read(app: app, completion: completion)
     }
 
     /// This is the only operation that may show the system's Finder Automation prompt.
@@ -101,60 +86,31 @@ final class SelectionContextProvider {
         }
     }
 
-    private func activeApplicationChanged() {
-        generation &+= 1
-        let version = generation
-        queue.async {
-            self.workerGeneration = version
-            self.cached = nil
-            self.removeAXObserver()
-        }
-        pollActiveApplication()
-    }
-
-    private func pollActiveApplication() {
-        guard running, let app = NSWorkspace.shared.frontmostApplication,
-              app.processIdentifier != ProcessInfo.processInfo.processIdentifier,
-              shouldObserve?(app.bundleIdentifier ?? "") == true else {
-            queue.async { self.cached = nil; self.removeAXObserver() }
-            return
-        }
-        // Coalesce on the main queue before submitting work; a slow AX server must
-        // not leave an ever-growing queue of stale polling requests.
-        guard !pollPending else { return }
-        pollPending = true
-        let source = Self.source(app)
-        let version = generation
-        queue.async {
-            defer { DispatchQueue.main.async { self.pollPending = false } }
-            guard version == self.workerGeneration else { return }
-            _ = self.capture(source, allowCached: false, installObserver: true)
-        }
-    }
-
-    private func read(app: NSRunningApplication, allowCached: Bool,
-                      completion: @escaping (ActionContext) -> Void) {
+    private func read(app: NSRunningApplication, completion: @escaping (ActionContext) -> Void) {
         onMain { [weak self] in
             guard let self else { return }
             let source = Self.source(app)
-            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == source.pid else {
-                self.queue.async { self.cached = nil }
+            guard self.running else {
+                completion(self.empty(source, "选区读取已停止，请重新打开菜单。"))
+                return
+            }
+            guard self.frontmostPID() == source.pid else {
                 completion(self.empty(source, "请先回到原 App，选中内容后再打开菜单。"))
                 return
             }
             guard !app.isTerminated, source.pid != ProcessInfo.processInfo.processIdentifier,
                   self.shouldObserve?(source.bundleID) == true else {
-                self.queue.async { self.cached = nil }
                 completion(self.empty(source, "这个 App 尚未启用需要选中内容的动作。"))
                 return
             }
             let version = self.generation
             self.queue.async {
-                let result = self.capture(source, allowCached: allowCached, installObserver: false)
+                let result = self.selectionReader?(source) ?? self.capture(source)
                 DispatchQueue.main.async {
                     // Switching apps while an AX request is outstanding invalidates its content.
-                    guard version == self.generation,
-                          NSWorkspace.shared.frontmostApplication?.processIdentifier == source.pid else {
+                    guard self.running, version == self.generation,
+                          self.frontmostPID() == source.pid, !app.isTerminated,
+                          self.shouldObserve?(source.bundleID) == true else {
                         completion(self.empty(source, "读取期间切换了 App，请重新选择。"))
                         return
                     }
@@ -164,21 +120,15 @@ final class SelectionContextProvider {
         }
     }
 
-    private func capture(_ source: Source, allowCached: Bool, installObserver: Bool) -> ActionContext {
-        guard AXIsProcessTrusted() else { return invalidate(source, "请在系统设置的“辅助功能”中允许 Presslet 读取选中内容。") }
+    private func capture(_ source: Source) -> ActionContext {
+        guard AXIsProcessTrusted() else { return empty(source, "请在系统设置的“辅助功能”中允许 Presslet 读取选中内容。") }
         let app = AXUIElementCreateApplication(source.pid)
         AXUIElementSetMessagingTimeout(app, 0.15)
         guard let identity = identity(for: app) else {
-            return invalidate(source, "无法读取这个 App 当前窗口中的选中内容。")
+            return empty(source, "无法读取这个 App 当前窗口中的选中内容。")
         }
         guard !isSecure(identity.element) else {
-            return invalidate(source, "密码输入框中的内容不可读取。")
-        }
-        if installObserver { updateAXObserver(source: source, app: app, element: identity.element) }
-        if allowCached, let saved = cached, saved.source.pid == source.pid,
-           saved.source.bundleID == source.bundleID, saved.identity.matches(identity),
-           (0...0.5).contains(Date().timeIntervalSince(saved.context.capturedAt)) {
-            return saved.context
+            return empty(source, "密码输入框中的内容不可读取。")
         }
         let context: ActionContext
         if source.bundleID == "com.apple.finder" {
@@ -187,14 +137,14 @@ final class SelectionContextProvider {
             var value: CFTypeRef?
             let status = AXUIElementCopyAttributeValue(identity.element, kAXSelectedTextAttribute as CFString, &value)
             guard status == .success, let text = value as? String, !text.isEmpty else {
-                return invalidate(source, "没有可读取的选中文字，或这个 App 不提供选文。")
+                return empty(source, "没有可读取的选中文字，或这个 App 不提供选文。")
             }
-            guard text.utf8.count <= textLimit else { return invalidate(source, "选中文字超过 1 MB，请缩小选择范围。") }
+            guard text.utf8.count <= textLimit else { return empty(source, "选中文字超过 1 MB，请缩小选择范围。") }
             context = makeContext(source, selectedText: text, files: [])
         }
-        if context.selectedText?.isEmpty == false || !context.fileURLs.isEmpty {
-            cached = Cached(source: source, identity: identity, context: context)
-        } else { cached = nil }
+        guard let currentIdentity = self.identity(for: app), identity.matches(currentIdentity) else {
+            return empty(source, "读取期间窗口或焦点发生变化，请重新选择。")
+        }
         return context
     }
 
@@ -231,46 +181,6 @@ final class SelectionContextProvider {
         return false
     }
 
-    private func updateAXObserver(source: Source, app: AXUIElement, element: AXUIElement) {
-        if observerPID != source.pid {
-            removeAXObserver()
-            var created: AXObserver?
-            let status = AXObserverCreate(source.pid, { _, _, _, refcon in
-                guard let refcon else { return }
-                let owner = Unmanaged<SelectionContextProvider>.fromOpaque(refcon).takeUnretainedValue()
-                DispatchQueue.main.async { [weak owner] in owner?.pollActiveApplication() }
-            }, &created)
-            guard status == .success, let created else { return }
-            observer = created
-            observerApp = app
-            observerPID = source.pid
-            let pointer = Unmanaged.passUnretained(self).toOpaque()
-            for notification in [kAXFocusedUIElementChangedNotification, kAXFocusedWindowChangedNotification] {
-                AXObserverAddNotification(created, app, notification as CFString, pointer)
-            }
-            CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(created), .commonModes)
-        }
-        guard let observer else { return }
-        if let previous = observerElement, CFEqual(previous, element) { return }
-        if let previous = observerElement {
-            AXObserverRemoveNotification(observer, previous, kAXSelectedTextChangedNotification as CFString)
-        }
-        observerElement = element
-        AXObserverAddNotification(observer, element, kAXSelectedTextChangedNotification as CFString,
-                                  Unmanaged.passUnretained(self).toOpaque())
-        // The 200 ms active-app poll also covers applications that reject AX notifications.
-    }
-
-    private func removeAXObserver() {
-        if let observer {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
-        }
-        observer = nil
-        observerApp = nil
-        observerElement = nil
-        observerPID = nil
-    }
-
     private func finderPermission(ask: Bool) -> OSStatus {
         let target = NSAppleEventDescriptor(bundleIdentifier: "com.apple.finder")
         return AEDeterminePermissionToAutomateTarget(target.aeDesc, AEEventClass(kAECoreSuite), AEEventID(kAEGetData), ask)
@@ -278,7 +188,7 @@ final class SelectionContextProvider {
 
     private func finderSelection(_ source: Source) -> ActionContext {
         guard finderPermission(ask: false) == noErr else {
-            return invalidate(source, "读取 Finder 文件需要“自动化”授权，请点击“允许读取 Finder”后再试。")
+            return empty(source, "读取 Finder 文件需要“自动化”授权，请点击“允许读取 Finder”后再试。")
         }
         // Finder's selection is a list of object references. Ask for their URL property
         // in one read-only event rather than inferring paths from displayed filenames.
@@ -289,7 +199,7 @@ final class SelectionContextProvider {
         everyItem.setDescriptor(NSAppleEventDescriptor(enumCode: OSType(kAEAll)), forKeyword: AEKeyword(keyAEKeyData))
         everyItem.setDescriptor(selection, forKeyword: AEKeyword(keyAEContainer))
         guard let items = everyItem.coerce(toDescriptorType: DescType(typeObjectSpecifier)) else {
-            return invalidate(source, "无法创建 Finder 文件读取请求。")
+            return empty(source, "无法创建 Finder 文件读取请求。")
         }
         let urls = property(Self.code("pURL"), container: items)
         let event = NSAppleEventDescriptor(eventClass: AEEventClass(kAECoreSuite), eventID: AEEventID(kAEGetData),
@@ -299,28 +209,28 @@ final class SelectionContextProvider {
         do {
             let reply = try event.sendEvent(options: [.waitForReply, .neverInteract], timeout: 0.3)
             if let error = reply.paramDescriptor(forKeyword: AEKeyword(keyErrorNumber)), error.int32Value != 0 {
-                return invalidate(source, "Finder 未返回选中文件（\(error.int32Value)）。")
+                return empty(source, "Finder 未返回选中文件（\(error.int32Value)）。")
             }
             guard let result = reply.paramDescriptor(forKeyword: AEKeyword(keyDirectObject)) else {
-                return invalidate(source, "Finder 未返回选中文件。")
+                return empty(source, "Finder 未返回选中文件。")
             }
             let descriptors: [NSAppleEventDescriptor]
             if result.descriptorType == DescType(typeAEList) {
-                guard result.numberOfItems <= fileLimit else { return invalidate(source, "一次最多读取 100 个文件，请缩小选择范围。") }
+                guard result.numberOfItems <= fileLimit else { return empty(source, "一次最多读取 100 个文件，请缩小选择范围。") }
                 descriptors = (0..<result.numberOfItems).compactMap { result.atIndex($0 + 1) }
             } else { descriptors = [result] }
-            guard !descriptors.isEmpty else { return invalidate(source, "Finder 中尚未选中文件。") }
+            guard !descriptors.isEmpty else { return empty(source, "Finder 中尚未选中文件。") }
             var files: [URL] = []
             for descriptor in descriptors {
                 guard let text = descriptor.stringValue, let url = URL(string: text), url.isFileURL,
                       url.host == nil || url.host == "" || url.host == "localhost",
                       url.path.hasPrefix("/") else {
-                    return invalidate(source, "Finder 未提供可靠的本地文件地址。")
+                    return empty(source, "Finder 未提供可靠的本地文件地址。")
                 }
                 files.append(url)
             }
             return makeContext(source, selectedText: nil, files: files)
-        } catch { return invalidate(source, "无法读取 Finder 选中文件，请检查授权并重试。") }
+        } catch { return empty(source, "无法读取 Finder 选中文件，请检查授权并重试。") }
     }
 
     private func property(_ code: OSType, container: NSAppleEventDescriptor) -> NSAppleEventDescriptor {
@@ -344,10 +254,6 @@ final class SelectionContextProvider {
     }
     private func empty(_ source: Source, _ reason: String) -> ActionContext {
         makeContext(source, selectedText: nil, files: [], reason: reason)
-    }
-    private func invalidate(_ source: Source, _ reason: String) -> ActionContext {
-        cached = nil
-        return empty(source, reason)
     }
     private func onMain(_ body: @escaping () -> Void) {
         if Thread.isMainThread { body() } else { DispatchQueue.main.async(execute: body) }

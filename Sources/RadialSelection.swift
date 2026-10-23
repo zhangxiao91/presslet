@@ -41,19 +41,44 @@ struct RadialItem {
             return [CGFloat.pi / 2, .pi, 0][max(0, min(2, index))]
         }
         let count = max(4, min(9, count))
+        let radii = menuRadii(count: count)
         let angle = CGFloat.pi / 2 - CGFloat(index) * 2 * .pi / CGFloat(count)
-        return atan2(sin(angle) * 165, cos(angle) * 235)
+        return atan2(sin(angle) * radii.y, cos(angle) * radii.x)
     }
 
     static func menuOffset(angle: CGFloat, count: Int) -> CGPoint {
         guard angle.isFinite else { return CGPoint(x: 0, y: 0) }
+        let radii = menuRadii(count: count)
         if count <= 3 {
-            return CGPoint(x: cos(angle) * 145, y: sin(angle) * 118)
+            return CGPoint(x: cos(angle) * radii.x, y: sin(angle) * radii.y)
         }
         // Use the same ray for placement and selection even though the ring is elliptical.
         let x = cos(angle), y = sin(angle)
-        let radius = 1 / sqrt(x * x / (235 * 235) + y * y / (165 * 165))
+        let radius = 1 / sqrt(x * x / (radii.x * radii.x) + y * y / (radii.y * radii.y))
         return CGPoint(x: x * radius, y: y * radius)
+    }
+
+    static func menuOuterRadius(count: Int) -> CGFloat {
+        guard count > 3 else { return 230 }
+        let count = min(9, count)
+        let furthestCenter = (0..<count).map { index -> CGFloat in
+            let offset = menuOffset(angle: menuAngle(index: index, count: count), count: count)
+            return hypot(offset.x, offset.y)
+        }.max() ?? 0
+        return max(230, furthestCenter + 90)
+    }
+
+    private static func menuRadii(count: Int) -> CGPoint {
+        // Sparse menus stay within a short thumb movement. Denser rings reserve
+        // space for 142 × 56 cards, their selected scale and magnetic movement.
+        switch count {
+        case ...4: return CGPoint(x: 120, y: 92)
+        case 5: return CGPoint(x: 146, y: 112)
+        case 6: return CGPoint(x: 196, y: 96)
+        case 7: return CGPoint(x: 216, y: 114)
+        case 8: return CGPoint(x: 238, y: 110)
+        default: return CGPoint(x: 260, y: 176)
+        }
     }
 }
 

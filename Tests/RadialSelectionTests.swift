@@ -116,6 +116,7 @@ struct RadialSelectionTestRunner {
         expect(noItems.update(point(0)) == .outside, "An empty menu has no selectable direction")
         expect(noItems.release() == nil, "An empty menu cannot execute")
         for count in 1...9 {
+            let outerRadius = RadialItem.menuOuterRadius(count: count)
             let ringItems = (0..<count).map { index in
                 RadialItem(id: "action-\(index)", title: "Action \(index)", symbol: "circle",
                            angle: RadialItem.menuAngle(index: index, count: count))
@@ -123,7 +124,7 @@ struct RadialSelectionTestRunner {
             for index in ringItems.indices {
                 let offset = RadialItem.menuOffset(angle: ringItems[index].angle, count: count)
                 let target = CGPoint(x: center.x + offset.x, y: center.y + offset.y)
-                var selection = RadialSelection(center: center, items: ringItems, outerRadius: 310)
+                var selection = RadialSelection(center: center, items: ringItems, outerRadius: outerRadius)
                 expect(selection.update(target) == .action(index), "Every displayed action is selected along its actual placement ray")
                 expect(selection.release() == index, "All nine configured action indices remain executable")
                 expect(selection.release() == nil, "Ring releases execute once")
@@ -131,33 +132,53 @@ struct RadialSelectionTestRunner {
                 let error = abs(atan2(sin(measured - ringItems[index].angle), cos(measured - ringItems[index].angle)))
                 expect(error < 0.00001, "Rendered and selected angles agree")
             }
+            // Include the entire selected scale and magnetic travel envelope,
+            // rather than checking only the resting frames.
+            let cardWidth: CGFloat = 142 * 1.055 + 16
+            let cardHeight: CGFloat = 56 * 1.055 + 16
+            let centralActivity = CGRect(x: -36, y: -36, width: 72, height: 72)
+            let rects = ringItems.map { item -> CGRect in
+                let offset = RadialItem.menuOffset(angle: item.angle, count: count)
+                expect(hypot(offset.x, offset.y) + 90 <= outerRadius + 0.00001,
+                       "Every card retains room for its edges and travel inside the gesture boundary")
+                return CGRect(x: offset.x - cardWidth / 2, y: offset.y - cardHeight / 2,
+                              width: cardWidth, height: cardHeight)
+            }
+            for first in rects.indices {
+                expect(!rects[first].intersects(centralActivity),
+                       "Card motion leaves the central pressure bubble clear")
+                for second in rects.indices where second > first {
+                    expect(!rects[first].intersects(rects[second]),
+                           "Action cards stay separate throughout selected scale and attraction")
+                }
+            }
+            if count <= 4 {
+                let top = RadialItem.menuOffset(angle: .pi / 2, count: count)
+                let side = RadialItem.menuOffset(angle: 0, count: count)
+                expect(abs(top.y - 92) < 0.00001 && abs(side.x - 120) < 0.00001,
+                       "Small menus keep the upper card at 92 points and side cards at 120 points")
+            }
+            if count <= 3 {
+                expect(outerRadius == 230, "Small menus preserve their familiar outer cancellation distance")
+            }
             if count >= 4 {
                 for angle in stride(from: CGFloat(-180), to: 180, by: 3) {
-                    var selection = RadialSelection(center: center, items: ringItems, outerRadius: 310)
+                    var selection = RadialSelection(center: center, items: ringItems, outerRadius: outerRadius)
                     if case .action(let index) = selection.update(point(angle)) {
                         expect(ringItems.indices.contains(index), "Every ring sector refers to a configured action")
                     } else { expect(false, "Expanded rings leave no unreachable gaps between actions") }
                 }
-                let rects = ringItems.map { item -> CGRect in
-                    let offset = RadialItem.menuOffset(angle: item.angle, count: count)
-                    return CGRect(x: offset.x - 71, y: offset.y - 28, width: 142, height: 56)
-                }
-                for first in rects.indices {
-                    for second in rects.indices where second > first {
-                        expect(!rects[first].intersects(rects[second]), "Expanded action capsules never overlap")
-                    }
-                }
-                var back = RadialSelection(center: center, items: ringItems, defaultIndex: count - 1, outerRadius: 310)
+                var back = RadialSelection(center: center, items: ringItems, defaultIndex: count - 1, outerRadius: outerRadius)
                 back.update(point(90))
                 expect(back.update(center) == .center, "Returning from an expanded ring clears focus")
                 expect(back.release() == nil, "Returning to center cancels an expanded menu default")
-                var outside = RadialSelection(center: center, items: ringItems, outerRadius: 310)
-                expect(outside.update(point(90, radius: 311)) == .outside, "Expanded rings retain their outer cancellation boundary")
+                var outside = RadialSelection(center: center, items: ringItems, outerRadius: outerRadius)
+                expect(outside.update(point(90, radius: outerRadius + 1)) == .outside, "Expanded rings retain their outer cancellation boundary")
                 expect(outside.release() == nil, "No ring action executes beyond the outer boundary")
                 // The midpoint uses the actual ellipse angles rather than nominal equal wedges.
                 let first = ringItems[0].angle, second = ringItems[1].angle
                 let midpoint = (first + second) / 2
-                var stable = RadialSelection(center: center, items: ringItems, outerRadius: 310)
+                var stable = RadialSelection(center: center, items: ringItems, outerRadius: outerRadius)
                 expect(stable.update(point(first * 180 / .pi)) == .action(0), "A ring starts on its upper action")
                 expect(stable.update(point((midpoint - 7 * .pi / 180) * 180 / .pi)) == .action(0), "A small move over a ring boundary does not flicker")
                 expect(stable.update(point((midpoint - 9 * .pi / 180) * 180 / .pi)) == .action(1), "A deliberate move crosses the ring boundary")

@@ -9,6 +9,11 @@ struct InputConnectionState: Equatable {
     var error: String?
 }
 
+protocol PressureTapStopping: AnyObject {
+    func requestStop()
+    func requestStop(afterStopped completion: @escaping () -> Void)
+}
+
 /// Owns platform listeners and delivers their events asynchronously, in order.
 /// The tap itself only consults cached policy, decides filtering, and buffers input.
 final class PressureInputManager {
@@ -39,7 +44,7 @@ final class PressureInputManager {
 
     /// Owns the port, source, and callback context until its thread has removed
     /// the source and invalidated the port. Stop is a signal, never a join.
-    private final class TapWorker {
+    private final class TapWorker: PressureTapStopping {
         let port: CFMachPort
         private let source: CFRunLoopSource
         private let context: TapContext
@@ -47,6 +52,8 @@ final class PressureInputManager {
         private let ready = DispatchSemaphore(value: 0)
         private var runLoop: CFRunLoop?
         private var stopping = false
+        private var stopped = false
+        private var stopCallbacks: [() -> Void] = []
 
         init?(port: CFMachPort, context: TapContext) {
             guard let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0) else { return nil }
@@ -72,7 +79,17 @@ final class PressureInputManager {
         }
 
         func requestStop() {
+            requestStop(afterStopped: {})
+        }
+
+        func requestStop(afterStopped completion: @escaping () -> Void) {
             control.lock()
+            if stopped {
+                control.unlock()
+                DispatchQueue.main.async(execute: completion)
+                return
+            }
+            stopCallbacks.append(completion)
             stopping = true
             let loop = runLoop
             control.unlock()
@@ -104,7 +121,12 @@ final class PressureInputManager {
             CFRunLoopRemoveSource(loop, source, .commonModes)
             control.lock()
             runLoop = nil
+            stopped = true
+            let callbacks = stopCallbacks
+            stopCallbacks.removeAll()
             control.unlock()
+            // This runs only after the final event-tap callback has returned.
+            for callback in callbacks { DispatchQueue.main.async(execute: callback) }
             // The thread closure retains self, including context, through here.
             withExtendedLifetime(context) {}
         }
@@ -123,11 +145,55 @@ final class PressureInputManager {
     private var localMonitor: Any?
     private var globalMonitor: Any?
     private var tap: CFMachPort?
-    private var tapWorker: TapWorker?
+    private var tapWorker: PressureTapStopping?
     private var observing = false
+    private var dragRouter = PressDragEventRouter()
+    private var waitingForReleaseToStop = false
+    private var restartAfterRelease = false
+    private var stopCompletions: [() -> Void] = []
+    private var pendingWorkerStops = 0
+    #if PRESSLET_INPUT_TESTING
+    private var testingRestart: (() -> Void)?
+    #endif
 
     init(bufferCapacity: Int = 1024) {
         buffer = PressureEventBuffer(capacity: bufferCapacity)
+    }
+
+    #if PRESSLET_INPUT_TESTING
+    // In-memory event tests provide a fake tap. They neither install system
+    // listeners nor post mouse input to other processes.
+    init(testingWorker: PressureTapStopping, policy: PressureInputPolicy,
+         restart: @escaping () -> Void) {
+        buffer = PressureEventBuffer(capacity: 1024)
+        self.policy = policy
+        testingRestart = restart
+        tapWorker = testingWorker
+        observing = true
+        generation = 1
+        buffer.reset(generation: generation)
+        state = InputConnectionState(hasTap: true, tapEnabled: true, canFilter: true)
+    }
+
+    @discardableResult
+    func testingReceive(type: CGEventType, event: CGEvent) -> Bool {
+        handleTap(type: type, event: event, token: generation) == nil
+    }
+
+    func testingRoutedEvent(type: CGEventType, event: CGEvent) -> CGEvent? {
+        handleTap(type: type, event: event, token: generation)?.takeUnretainedValue()
+    }
+
+    @discardableResult
+    func testingTakeOver(pid: Int32) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return dragRouter.begin(targetPID: pid)
+    }
+    #endif
+
+    var isIsolatingPress: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return dragRouter.isActive
     }
 
     var connectionState: InputConnectionState {
@@ -181,6 +247,13 @@ final class PressureInputManager {
         precondition(Thread.isMainThread)
         lock.lock()
         guard !observing else { lock.unlock(); return }
+        if waitingForReleaseToStop || pendingWorkerStops > 0 {
+            restartAfterRelease = true
+            state.error = waitingForReleaseToStop ? "请先松开触控板，再恢复跨 App 输入。" : "正在重新连接输入，请稍候。"
+            _ = enqueueLocked(.status(state), kind: .other, token: generation)
+            lock.unlock()
+            return
+        }
         observing = true
         generation &+= 1
         let token = generation
@@ -249,24 +322,89 @@ final class PressureInputManager {
         lock.unlock()
     }
 
-    func stop() {
+    func stop(afterRelease completion: (() -> Void)? = nil) {
         precondition(Thread.isMainThread)
         if let globalMonitor { NSEvent.removeMonitor(globalMonitor) }
         globalMonitor = nil
         lock.lock()
         observing = false
-        generation &+= 1
-        let oldWorker = tapWorker
-        tapWorker = nil
-        tap = nil
+        restartAfterRelease = false
+        if let completion { stopCompletions.append(completion) }
+        let mustFinishPress = dragRouter.isActive && tapWorker != nil
+        waitingForReleaseToStop = mustFinishPress
+        let oldWorker: PressureTapStopping?
+        if mustFinishPress {
+            // Keep only the physical drag/up path alive. The original application
+            // has already received down, so disabling the tap here would leak drag.
+            oldWorker = nil
+        } else {
+            generation &+= 1
+            oldWorker = tapWorker
+            tapWorker = nil
+            tap = nil
+        }
         deliveryEpoch &+= 1
         buffer.reset(generation: generation)
         drainScheduled = false
         filter.cancelUntilNextDown()
         state = InputConnectionState()
+        if mustFinishPress { state.error = "请先松开触控板，结束本次重按。" }
         _ = enqueueLocked(.status(state), kind: .other, token: generation)
+        if oldWorker != nil { pendingWorkerStops += 1 }
         lock.unlock()
-        oldWorker?.requestStop()
+        stopWorker(oldWorker)
+    }
+
+    private func finishDeferredStop(token: UInt64) {
+        precondition(Thread.isMainThread)
+        lock.lock()
+        guard token == generation, waitingForReleaseToStop, !dragRouter.isActive else { lock.unlock(); return }
+        waitingForReleaseToStop = false
+        let oldWorker = tapWorker
+        tapWorker = nil
+        tap = nil
+        generation &+= 1
+        deliveryEpoch &+= 1
+        buffer.reset(generation: generation)
+        drainScheduled = false
+        state = InputConnectionState()
+        _ = enqueueLocked(.status(state), kind: .other, token: generation)
+        if oldWorker != nil { pendingWorkerStops += 1 }
+        lock.unlock()
+        stopWorker(oldWorker)
+    }
+
+    private func stopWorker(_ worker: PressureTapStopping?) {
+        if let worker {
+            worker.requestStop(afterStopped: { [weak self] in
+                guard let self else { return }
+                self.lock.lock()
+                self.pendingWorkerStops -= 1
+                self.lock.unlock()
+                self.completeStopIfReady()
+            })
+        } else {
+            completeStopIfReady()
+        }
+    }
+
+    private func completeStopIfReady() {
+        precondition(Thread.isMainThread)
+        lock.lock()
+        guard !waitingForReleaseToStop, pendingWorkerStops == 0 else { lock.unlock(); return }
+        let restart = restartAfterRelease
+        restartAfterRelease = false
+        let completions = stopCompletions
+        stopCompletions.removeAll()
+        lock.unlock()
+        if restart {
+            #if PRESSLET_INPUT_TESTING
+            if let testingRestart { testingRestart() } else { start() }
+            #else
+            start()
+            #endif
+        }
+        for completion in completions { DispatchQueue.main.async(execute: completion) }
     }
 
     func retry() {
@@ -304,7 +442,7 @@ final class PressureInputManager {
 
     private func handleTap(type: CGEventType, event: CGEvent, token: UInt64) -> Unmanaged<CGEvent>? {
         lock.lock(); defer { lock.unlock() }
-        guard observing, token == generation else { return Unmanaged.passUnretained(event) }
+        guard token == generation else { return Unmanaged.passUnretained(event) }
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             filter.cancelUntilNextDown()
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
@@ -316,7 +454,33 @@ final class PressureInputManager {
             scheduleDrainLocked()
             return Unmanaged.passUnretained(event)
         }
-        guard policy.enabled, !policy.paused else { return Unmanaged.passUnretained(event) }
+        if type == .leftMouseDown || type == .leftMouseDragged || type == .leftMouseUp {
+            // Run before pause/stop checks: a captured press must remain isolated
+            // until its physical release even when its menu has been cancelled.
+            let routed = dragRouter.route(type: type, event: event, frontmostPID: policy.frontmostPID)
+            if type == .leftMouseDown, observing, policy.enabled, !policy.paused {
+                filter.mouseDown(policy: policy)
+            }
+            if type == .leftMouseUp { filter.mouseUp() }
+            if observing, policy.enabled, !policy.paused {
+                if let physical = routed.observed {
+                    let kind: PressureBufferedKind = type == .leftMouseDown ? .mouseDown
+                        : type == .leftMouseUp ? .mouseUp : .coalescible("tap.drag")
+                    _ = enqueueLocked(.mouse(type, physical), kind: kind, token: token)
+                } else {
+                    deliveryEpoch &+= 1
+                    buffer.replaceWithCancellation(.cancel("无法保留本次指针位置，请重新重按。"), generation: token)
+                    scheduleDrainLocked()
+                }
+            }
+            if routed.endedIsolation, waitingForReleaseToStop {
+                DispatchQueue.main.async { [weak self] in self?.finishDeferredStop(token: token) }
+            }
+            if type == .leftMouseDragged, routed.suppress { filter.recordBlockedDrag() }
+            if routed.pairedMouseUp { filter.recordPairedMouseUp() }
+            return routed.suppress ? nil : Unmanaged.passUnretained(event)
+        }
+        guard observing, policy.enabled, !policy.paused else { return Unmanaged.passUnretained(event) }
         if type.rawValue == UInt32(NSEvent.EventType.gesture.rawValue) {
             filter.rawGesture(policy: policy)
             guard policy.gestureEnabled, !filter.awaitingFreshDown,
@@ -325,19 +489,27 @@ final class PressureInputManager {
                 return Unmanaged.passUnretained(event)
             }
             let target = Int32(clamping: ownedEvent.getIntegerValueField(.eventTargetUnixProcessID))
+            let resolvedPID = target == 0 ? policy.frontmostPID : target
             var nextFilter = filter
-            let decision = nextFilter.pressure(stage: converted.stage, targetPID: target,
+            var decision = nextFilter.pressure(stage: converted.stage, targetPID: target,
                                                policy: policy, canFilter: state.canFilter)
-            let queued = enqueueLocked(.pressure(converted, decision.eligibleInput),
+            if converted.stage >= 2, decision.eligibleInput, state.canFilter,
+               policy.autoMenu, policy.menuPIDs.contains(resolvedPID) {
+                dragRouter.begin(targetPID: resolvedPID)
+            }
+            if decision.shouldBlock, !dragRouter.isActive {
+                nextFilter = filter
+                decision = nextFilter.pressure(stage: converted.stage, targetPID: target,
+                                              policy: policy, canFilter: false)
+            }
+            // An observing-only tap cannot isolate dragging. Do not open a held
+            // cross-app menu unless this physical press was actually captured.
+            let eligible = decision.eligibleInput && (converted.stage < 2 || dragRouter.isActive)
+            let queued = enqueueLocked(.pressure(converted, eligible),
                                        kind: .pressure(stage: converted.stage), token: token)
             if queued != .overflow { filter = nextFilter }
             return queued != .overflow && decision.shouldBlock ? nil : Unmanaged.passUnretained(event)
         }
-        if type == .leftMouseDown { filter.mouseDown(policy: policy) }
-        if type == .leftMouseUp { filter.mouseUp() }
-        let kind: PressureBufferedKind = type == .leftMouseDown ? .mouseDown
-            : type == .leftMouseUp ? .mouseUp : .coalescible("tap.drag")
-        _ = enqueueLocked(.mouse(type, event.copy() ?? event), kind: kind, token: token)
         return Unmanaged.passUnretained(event)
     }
 
